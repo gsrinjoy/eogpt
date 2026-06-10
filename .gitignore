@@ -1,0 +1,5 @@
+ecogpt_vectordb/
+.ipynb_checkpoints/
+__pycache__/
+.venv/
+ecogpt_master_dataset.csv
