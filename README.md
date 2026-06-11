@@ -20,6 +20,18 @@ ollama serve & ollama pull mistral:7b-instruct   # AMD ROCm-accelerated
 # or: os.environ["HF_TOKEN"]="hf_xxx" in a cell before Cell 7
 ```
 
+## 🚀 Production UI (Streamlit)
+
+```bash
+pip install streamlit
+streamlit run ecogpt_app.py        # or just run the notebook's last code cell
+```
+
+`ecogpt_app.py` (polished UI: metric cards, satellite map with rivers & plantable plots, impact
+charts, solar plan, RAG Q&A chat) imports `ecogpt_core.py` (the engine — auto-assembled from the
+same notebook cells). On a remote AMD Jupyter instance, reach the app via the platform proxy
+(`/proxy/8501/`) or an SSH tunnel.
+
 ## Usage
 - **Cell 10** — chat widget: enter a city or `lat, lon` → full report; follow-up questions are RAG-grounded with citations
 - **Cell 11** — `build_dashboard(lat, lon)`: pollution heatmap + plantation zones + CO₂ projection
