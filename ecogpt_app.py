@@ -46,12 +46,16 @@ if run and query.strip():
     if loc is None:
         st.error("Couldn't identify that location — try a city name or `lat, lon` coordinates.")
     else:
+        st.session_state["audience_used"] = audience
         with st.spinner(f"8 agents analysing {loc[2]} …"):
-            report = core.ask_ecogpt(query.strip(), user_type=audience, polish=False)
+            report = core.ask_ecogpt(query.strip(), user_type=audience, polish=False,
+                                     survey_radius_km=radius_km)
             st.session_state["report"] = report
-            st.session_state["bundle"] = dict(core.ask_ecogpt.last)
+            bundle = dict(core.ask_ecogpt.last)
+            st.session_state["bundle"] = bundle
             st.session_state["loc"] = loc
-            st.session_state["spaces"] = core.get_open_spaces(loc[0], loc[1], radius_km * 1000)
+            # spaces already fetched inside ask_ecogpt — reuse, no duplicate OSM call
+            st.session_state["spaces"] = bundle.get("spaces", [])
 
 if "bundle" not in st.session_state:
     st.title("🌿 EcoGPT — Environmental Intelligence")
@@ -71,8 +75,11 @@ rivers = [s for s in spaces if s["kind"] == "river"]
 waterbodies = [s for s in spaces if s["kind"] == "water"]
 
 # ───────────────────────── header + metric cards ─────────────────────────
+_audience_badge = {"government": "🏛 Government/Policy", "ngo": "🤝 NGO/Community",
+                   "researcher": "🔬 Researcher", "default": "🌍 General"
+                   }.get(st.session_state.get("audience_used", "default"), "🌍 General")
 st.title(f"🌿 {ctx['location']['city']}, {ctx['location']['country']}")
-st.caption(f"📡 {ctx['data_source']}  ·  {ctx['location']['climate_name']} ({ctx['location']['climate_zone']})")
+st.caption(f"📡 {ctx['data_source']}  ·  {ctx['location']['climate_name']} ({ctx['location']['climate_zone']})  ·  {_audience_badge} report")
 
 m = st.columns(6)
 aqi = ctx["aqi"]["score"]
@@ -189,10 +196,10 @@ with tab_charts:
         st.pyplot(fig, use_container_width=True)
 
         fig, a = plt.subplots(figsize=(6, 3))
-        base_n = {"Rural":50000,"Peri-urban":25000,"Urban":15000,"Dense Urban":10000}[ctx["density_class"]]
+        base_n = carbon["trees_modelled"]   # from actual OSM open-space survey, not a hardcoded constant
         scen = [(base_n,5),(base_n*3,10),(base_n*6,25)]
         sims = [core.simulate_intervention(aqi, n, n/plant["trees_per_hectare"], y) for n, y in scen]
-        lbl = [f"{n//1000}k/{y}y" for n, y in scen]
+        lbl = [f"{n//1000}k/{y}y" if n >= 1000 else f"{n}/{y}y" for n, y in scen]
         a.bar(lbl, [aqi]*3, color=GRY, label="today")
         a.bar(lbl, [x["projected_aqi"] for x in sims], color=GRN, label="projected")
         a.legend(); a.set(title="What-if: plantation scenarios → AQI")
@@ -224,14 +231,25 @@ with tab_energy:
 
 # ───────────────────────── Q&A ─────────────────────────
 with tab_qa:
-    st.caption("RAG-grounded Q&A over the knowledge base + this location's context")
-    if "chat" not in st.session_state: st.session_state["chat"] = []
+    st.caption(f"RAG-grounded Q&A · knowledge base + {ctx['location']['city']} pipeline context")
+    st.info("💡 Ask anything about this location: *which species fight NO2?* · "
+            "*how do khadins work?* · *how much water can a rooftop harvest?* · "
+            "*is solar viable here?* · *what soil improvements are needed?*")
+    if "chat" not in st.session_state:
+        st.session_state["chat"] = []
     for role, msg in st.session_state["chat"]:
         st.chat_message(role).markdown(msg)
-    if q := st.chat_input("e.g. which species absorb NO2? · how do khadins work?"):
+    if q := st.chat_input(f"Ask about {ctx['location']['city']}…"):
         st.session_state["chat"].append(("user", q))
         st.chat_message("user").markdown(q)
-        with st.spinner("retrieving…"):
-            ans = core.ask_followup(q)
+        with st.spinner("Analysing…"):
+            try:
+                ans = core.ask_followup(q)
+            except Exception as e:
+                ans = f"⚠️ Error: {e}. Try rephrasing or run the analysis again."
         st.session_state["chat"].append(("assistant", ans))
         st.chat_message("assistant").markdown(ans)
+    if st.session_state["chat"]:
+        if st.button("🗑 Clear chat", key="clear_chat"):
+            st.session_state["chat"] = []
+            st.rerun()

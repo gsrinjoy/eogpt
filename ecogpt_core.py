@@ -1455,11 +1455,22 @@ def run_urban_agent(ctx):
         "grounding": [{"id":c["id"],"source":c["source"],"relevance":c["relevance"]} for c in chunks]}
 
 # ---------------- Agent 7: Carbon ----------------
-def run_carbon_agent(ctx, plantation, trees_to_plant=None):
+def run_carbon_agent(ctx, plantation, trees_to_plant=None, open_space_ha=None):
+    """Carbon sequestration agent.
+    trees_to_plant: explicit override (overrides open_space_ha and density default).
+    open_space_ha:  total surveyed open land from OSM → trees = ha × trees_per_hectare.
+    Falls back to density-class defaults when neither is supplied."""
     sp = plantation["species"][:10]
     if trees_to_plant is None:
-        trees_to_plant = {"Rural": 50000, "Peri-urban": 25000,
-                          "Urban": 15000, "Dense Urban": 10000}[ctx["density_class"]]
+        if open_space_ha is not None and open_space_ha > 0:
+            trees_to_plant = int(open_space_ha * plantation["trees_per_hectare"])
+        else:
+            trees_to_plant = {"Rural": 50000, "Peri-urban": 25000,
+                              "Urban": 15000, "Dense Urban": 10000}[ctx["density_class"]]
+    # Sanity bounds — cap per density class; floor at 500 to keep maths meaningful
+    dc_cap = {"Rural": 2_000_000, "Peri-urban": 500_000,
+              "Urban": 200_000, "Dense Urban": 100_000}[ctx["density_class"]]
+    trees_to_plant = max(500, min(trees_to_plant, dc_cap))
     mean_rate = float(np.mean([s["co2_kg_yr"] for s in sp]))  # kg/tree/yr mature
     def cum(years):
         tot = 0.0
@@ -1500,8 +1511,15 @@ def run_soil_recommendations(ctx):
         recs += ["Leaf-mould composting of autumn litter; avoid winter soil compaction",
                  "Street-tree pits ≥6 m³ with structural soil under pavements",
                  "Cover crops (clover/vetch) on any soil bare over winter"]
-    if ctx["location"]["city"].lower() in ("kolkata","sundarbans"):
-        recs.append("Coastal fringe salinity: prefer Casuarina, Pongamia; test EC before food crops")
+    # Coastal / estuarine salinity — detect by high humidity + tropical/monsoon + rainfall>1500
+    lat_ = ctx["location"].get("lat", 0)
+    _cn_ = fetch_climate_normals(ctx["location"]["lat"], ctx["location"]["lon"]) or {}
+    rain_ = _cn_.get("annual_rain_mm") or get_annual_rainfall(ctx["location"]["lat"], ctx["location"]["lon"])
+    near_coast = (kz in ("Af","Am","Aw") and ctx["humidity_avg"] > 75 and rain_ > 1500
+                  and abs(lat_) < 25)   # tropical coastline heuristic
+    if near_coast:
+        recs.append("Coastal/estuarine influence likely: prefer salt-tolerant Casuarina, Pongamia pinnata, "
+                    "Heritiera littoralis; test soil EC before food crops; avoid waterlogging-sensitive species")
     return {"recommendations": recs,
             "grounding": [{"id":c["id"],"source":c["source"],"relevance":c["relevance"]} for c in chunks]}
 
@@ -1668,14 +1686,80 @@ LOCATION_HELP = ("❓ **I couldn't identify a location in your message.** Please
     "Online geocoding covers any place on Earth; offline I know: "
     + ", ".join(sorted(n.title() for n in GAZETTEER)) + ".")
 
+def _user_type_note(user_type: str, ctx, pol, plant, water, energy, carbon, urban) -> str:
+    """Audience-specific section appended to the deterministic report."""
+    if user_type == "government":
+        aqi = ctx["aqi"]["score"]
+        rwh = water["rainwater_harvesting"]
+        return (
+            "\n---\n## 🏛 Policy Brief (Government/Municipal Authority)\n"
+            "*For municipal officers and regulators — enforcement, budget, and KPIs.*\n\n"
+            f"**Compliance status**: AQI {aqi} — "
+            f"{'⚠️ exceeds action threshold (>100); NAAQS/local standards require documented response' if aqi > 100 else '✅ within acceptable limits; preventive monitoring sufficient'}.\n"
+            f"**Budget anchors** (estimated):\n"
+            f"- Miyawaki micro-forest: ₹5–8L per 100-tree plot (3-yr canopy closure)\n"
+            f"- Avenue planting: ₹2,000–4,000/tree installed (including pit, guard, 2-yr maintenance)\n"
+            f"- RWH retrofit mandate on plots >300 m²: {rwh['per_100m2_roof_litres_yr']:,} L/yr per 100 m² (positive ROI in 3–5 yr)\n"
+            f"- Rooftop solar on public buildings: {energy['solar_plan']['potential_mwp_per_km2']} MWp/km² potential\n"
+            f"**KPI targets**: AQI <100 (3-yr); +{urban['required_green_ha_per_km2']} ha/km² green cover; RWH mandate enforced; "
+            f"{energy['solar_plan']['co2_avoided_t_per_km2_yr']:,} t CO2 avoided/yr/km² from solar.\n"
+            f"**Regulatory levers**: Tree-felling NOC reform; building by-law green-coverage mandate (30% for new construction); "
+            f"vehicle emission inspection zone; industrial stack CEM (continuous emission monitoring) mandate.\n"
+            f"**Carbon credits**: {carbon['annual_tonnes_at_maturity']:,} t CO2e/yr at maturity — "
+            "registerable under ICCM/Gold Standard voluntary markets (consult carbon registry).\n"
+        )
+    elif user_type == "ngo":
+        sp3 = ", ".join(s["common"] for s in plant["species"][:3])
+        rwh = water["rainwater_harvesting"]
+        return (
+            "\n---\n## 🤝 Community Action Guide (NGO / Civil Society)\n"
+            "*Low-cost, community-driven steps for field organizers and volunteers.*\n\n"
+            f"**This weekend** — community nursery: grow {sp3} from seeds/cuttings "
+            "(₹5–30/sapling vs ₹200+ bought); recruit one champion per street/block.\n"
+            f"**Schools programme**: Each class 'adopts' 10 trees, measures growth termly — "
+            "builds a local constituency and feeds data back to EcoGPT.\n"
+            f"**Water body drives**: Monthly Eichhornia (water hyacinth) removal + litter days; "
+            "link removed biomass to local biogas unit.\n"
+            f"**Quick water win**: RWH for 10 community buildings = {rwh['per_100m2_roof_litres_yr']*10:,} L/yr saved "
+            f"(10 × 100 m² roofs at {water['annual_rainfall_mm']} mm rain/yr).\n"
+            f"**Advocacy asks from municipal body**: Publicly visible AQI monitors; "
+            "open-plot registry protected from encroachment; RWH mandate enforced; "
+            "community nurseries counted in green-cover metrics.\n"
+            "**Funding signals**: CAMPA funds (India); Green Climate Fund sub-grants; CSR (Companies Act 2% mandate); "
+            "MGNREGA for rural soil/water works.\n"
+        )
+    elif user_type == "researcher":
+        return (
+            "\n---\n## 🔬 Methodological Notes (Researcher)\n"
+            "*Full data provenance, confidence levels, and model assumptions.*\n\n"
+            f"**Data source**: {ctx['data_source']}\n"
+            f"**Sensor completeness**: {ctx['data_completeness']:.0%} | Readings used: {ctx['readings_used']:,}\n"
+            f"**AQI model**: EPA breakpoint linear interpolation; sensor rescaling applied: "
+            f"{'; '.join(ctx['aqi'].get('notes', [])) or 'none'}.\n"
+            f"**Climate data**: ERA5 12-month trailing archive for exact coordinates (not nearest-city lookup); "
+            f"Köppen class computed from 12 monthly temp + rain normals via _koppen_from_monthlies().\n"
+            f"**Carbon model**: IPCC Tier-1-style logistic growth ramp (min(0.10+0.10y, 1.0)); "
+            f"15% cumulative mortality first 3 yr; i-Tree species-level CO2 rates; {carbon['confidence']}.\n"
+            f"**OSM land survey**: Overpass API, {ctx.get('survey_radius_km', 3)} km radius; "
+            f"tree capacity 1 tree/25 m² (open land); polygon area by Shoelace/equirectangular approx.\n"
+            f"**Terrain**: Open-Meteo elevation API 9-point grid (~1 km spacing) → slope class.\n"
+            f"**Population density**: OSM place-node population attribute → gazetteer → rural 300/km² fallback.\n"
+            f"**Assumptions flagged**: {'; '.join(ctx['assumptions']) or 'none'}.\n"
+            f"**Confidence summary**: Climate — High (ERA5 real data); Carbon — {carbon['confidence']}; "
+            f"AQI — {'High (IoT sensors)' if 'IoT' in ctx['data_source'] else 'Medium (modelled/CAMS)'}; "
+            f"Population — {'Medium (OSM)' if ctx['population_density'] > 200 else 'Low (rural estimate)'}.\n"
+        )
+    return ""  # "default" — no extra section
+
+
 def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type="default"):
     L = ctx["location"]
     sp_rows = "\n".join(
         f"| {s['scientific']} | {s['common']} | {s['role'][:45]} | {s['co2_kg_yr']} | {s['water']} | {s['native_to']} |"
         for s in plant["species"])
     pr = carbon["cumulative_tonnes_co2e"]
-    # scenarios + assumed settlement area scale with the density class (not Kolkata constants)
-    base_n = {"Rural": 50000, "Peri-urban": 25000, "Urban": 15000, "Dense Urban": 10000}[ctx["density_class"]]
+    # scenarios anchored to actual trees_modelled (from real OSM open-space data when available)
+    base_n = carbon["trees_modelled"]   # dynamic — based on surveyed open land, not a hardcoded constant
     area_ha = {"Rural": 150000, "Peri-urban": 60000, "Urban": 35000, "Dense Urban": 20000}[ctx["density_class"]]
     scenario_set = [(base_n, 5), (base_n*3, 10), (base_n*6, 25)]
     sims = [simulate_intervention(ctx["aqi"]["score"], n, n/plant["trees_per_hectare"], y,
@@ -1849,21 +1933,33 @@ With full implementation over 5 years: AQI improvement {"15–30" if ctx['aqi'][
 ---
 *Grounded in: {", ".join(sorted(set(g['source'] for agent in (pol,plant,water,urban,carbon,soil,energy) for g in agent['grounding'])))}.*
 *Figures marked (estimated)/(assumed) follow the EcoGPT no-fabrication policy.*
-"""
+{_user_type_note(user_type, ctx, pol, plant, water, energy, carbon, urban)}"""
     return report.strip()
 
-def ask_ecogpt(query: str, user_type: str = "default", polish: bool = True) -> str:
-    """Full EcoGPT pipeline: location → ingestion → specialists → synthesis → (LLM polish)."""
+def ask_ecogpt(query: str, user_type: str = "default", polish: bool = True,
+               survey_radius_km: float = 3.0) -> str:
+    """Full EcoGPT pipeline: location → ingestion → specialists → synthesis → (LLM polish).
+    survey_radius_km controls the OSM open-space land survey radius (default 3 km)."""
     loc = parse_location(query)
     if loc is None:
         return LOCATION_HELP
     lat, lon, label = loc
     ctx    = run_data_ingestion(lat, lon, label=label)
+    ctx["survey_radius_km"] = round(survey_radius_km, 1)   # pass through for researcher notes
     pol    = run_pollution_agent(ctx)
     plant  = run_plantation_agent(ctx)
     water  = run_water_agent(ctx)
     urban  = run_urban_agent(ctx)
-    carbon = run_carbon_agent(ctx, plant)
+
+    # Real open-space survey → accurate tree-count for carbon modelling
+    try:
+        spaces = get_open_spaces(lat, lon, radius_m=int(survey_radius_km * 1000))
+    except Exception:
+        spaces = []
+    open_plots = [s for s in spaces if s["kind"] == "open"]
+    total_open_ha = sum(s["area_m2"] for s in open_plots) / 10_000.0
+
+    carbon = run_carbon_agent(ctx, plant, open_space_ha=total_open_ha if total_open_ha > 0 else None)
     soil   = run_soil_recommendations(ctx)
     energy = run_energy_agent(ctx)
     report = run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type)
@@ -1875,26 +1971,162 @@ def ask_ecogpt(query: str, user_type: str = "default", polish: bool = True) -> s
         if polished and len(polished) > 400:
             report = polished
     ask_ecogpt.last = {"ctx":ctx,"pol":pol,"plant":plant,"water":water,
-                       "urban":urban,"carbon":carbon,"soil":soil,"energy":energy}
+                       "urban":urban,"carbon":carbon,"soil":soil,"energy":energy,
+                       "spaces": spaces}   # cached here — Streamlit uses this, no duplicate OSM call
     return report
 
+def _followup_from_context(question: str, ctx: dict, last: dict) -> str:
+    """Context-aware deterministic answer when no LLM is available.
+    Routes to the actual pipeline data for this location."""
+    q = question.lower()
+    plant  = last.get("plant", {})
+    water  = last.get("water", {})
+    energy = last.get("energy", {})
+    pol    = last.get("pol", {})
+    carbon = last.get("carbon", {})
+    soil   = last.get("soil", {})
+    L      = ctx.get("location", {})
+    city   = L.get("city", "this location")
+    kz     = L.get("climate_name", L.get("climate_zone", ""))
+
+    if any(w in q for w in ["tree","plant","species","forest","canopy","sapling","native","invasiv"]):
+        sp_rows = "\n".join(
+            f"- *{s['scientific']}* (**{s['common']}**) — {s['role'][:65]}, "
+            f"{s['co2_kg_yr']} kg CO2/yr, water need: {s['water']}"
+            for s in plant.get("species", [])[:8])
+        return (f"**Species recommended for {city}** ({kz}):\n{sp_rows}\n\n"
+                f"**Density**: {plant.get('trees_per_hectare')} trees/ha "
+                f"({'desert-mode reduced' if L.get('climate_zone','').startswith('B') else 'standard'})\n"
+                f"**Priority planting zones**: {'; '.join(plant.get('priority_zones', [])[:3])}\n"
+                f"**Arrangement**: {plant.get('spatial_arrangement','')[:120]}\n"
+                f"**Avoid (invasive)**: {', '.join(plant.get('avoid', []))}\n"
+                f"**Polyculture rule**: {plant.get('polyculture_rule','')}")
+
+    if any(w in q for w in ["water","rain","harvest","pond","river","flood","drought",
+                             "khadin","irrigation","rwh","wetland","stream"]):
+        rwh = water.get("rainwater_harvesting", {})
+        plan = "\n".join(f"- {r}" for r in water.get("restoration_plan", [])[:6])
+        return (f"**Water situation for {city}**: {water.get('stress_level')}\n"
+                f"Annual rainfall: **{water.get('annual_rainfall_mm')} mm/yr** "
+                f"({water.get('rainfall_source','estimate')})\n\n"
+                f"**Plan**:\n{plan}\n\n"
+                f"**Rainwater harvesting**: {rwh.get('per_100m2_roof_litres_yr',0):,} L/yr per 100 m² roof "
+                f"(covers **{rwh.get('household_demand_coverage_pct',0)}%** of a 5-person household demand)\n"
+                f"**Recharge**: {rwh.get('recharge_structures','')}\n"
+                f"**Irrigation**: {'; '.join(water.get('irrigation', []))}")
+
+    if any(w in q for w in ["solar","energy","wind","power","renewable","electricity","biogas",
+                             "photovoltaic","pv","turbine","agrivoltaic"]):
+        feasible = [i for i in energy.get("interventions", []) if "✅" in str(i.get("feasible",""))]
+        cond     = [i for i in energy.get("interventions", []) if "⚠️" in str(i.get("feasible",""))]
+        no_go    = [i for i in energy.get("interventions", []) if "❌" in str(i.get("feasible",""))]
+        sp = energy.get("solar_plan", {})
+        rows = "\n".join(f"✅ **{i['intervention']}**: {i['reason'][:90]}" for i in feasible)
+        rows += "\n" + "\n".join(f"⚠️ **{i['intervention']}**: {i['reason'][:90]}" for i in cond)
+        rows += "\n" + "\n".join(f"❌ **{i['intervention']}**: {i['reason'][:90]}" for i in no_go)
+        return (f"**Renewable energy for {city}** — solar {energy.get('solar_kwh_m2_day')} kWh/m²/d, "
+                f"wind {energy.get('wind_ms')} m/s, terrain: {energy.get('terrain',{}).get('slope_class','?')}\n\n"
+                f"**Interventions (feasibility-checked)**:\n{rows.strip()}\n\n"
+                f"**Solar action plan**: {sp.get('usable_rooftop_m2_per_km2',0):,} m²/km² rooftop usable → "
+                f"**{sp.get('potential_mwp_per_km2')} MWp/km²** → {sp.get('annual_generation_gwh_per_km2')} GWh/yr → "
+                f"**{sp.get('co2_avoided_t_per_km2_yr',0):,} t CO2 avoided/yr/km²**\n"
+                f"Rollout: {' → '.join(sp.get('phased_rollout',[]))}")
+
+    if any(w in q for w in ["aqi","air quality","pollution","no2","pm2","pm10","smog",
+                             "particulate","nitro","carbon monoxide","voc","dust"]):
+        actions = pol.get("actions", {})
+        short_  = "; ".join(actions.get("short_term_24_72h", [])[:2])
+        medium_ = "; ".join(actions.get("medium_term_1_6mo", [])[:2])
+        return (f"**Air quality for {city}**: AQI **{ctx.get('aqi',{}).get('score')} "
+                f"({ctx.get('aqi',{}).get('category')})**\n"
+                f"Dominant pollutant: {ctx.get('aqi',{}).get('dominant','?')}\n"
+                f"Source type: **{pol.get('source_apportionment',{}).get('classification','?')}** emissions "
+                f"(signals: {pol.get('source_apportionment',{}).get('signals',{})})\n"
+                f"Heat-island delta: {pol.get('heat_island_delta','?')}°C "
+                f"({'⚠️ flagged' if pol.get('heat_island_flag') else '✅ acceptable'})\n\n"
+                f"**Short-term (24–72 h)**: {short_}\n"
+                f"**Medium-term (1–6 mo)**: {medium_}\n"
+                f"**Expected gain**: {pol.get('expected_improvement','')}")
+
+    if any(w in q for w in ["carbon","co2","sequestration","sequester","offset","emit","greenhouse"]):
+        pr = carbon.get("cumulative_tonnes_co2e", {})
+        return (f"**Carbon sequestration — {city}** "
+                f"({carbon.get('trees_modelled',0):,} trees, mean {carbon.get('mean_species_rate_kg_yr',0)} kg CO2/tree/yr)\n"
+                f"| Year 1 | Year 5 | Year 10 | Year 25 |\n|---|---|---|---|\n"
+                f"| {pr.get('year_1',0):,} t | {pr.get('year_5',0):,} t | "
+                f"{pr.get('year_10',0):,} t | {pr.get('year_25',0):,} t |\n\n"
+                f"At maturity: **{carbon.get('annual_tonnes_at_maturity',0):,} t CO2e/yr** "
+                f"≈ {carbon.get('cars_equivalent_at_maturity',0):,} cars removed "
+                f"≈ {carbon.get('households_equivalent',0):,} households' electricity.\n"
+                f"Confidence: {carbon.get('confidence','')}")
+
+    if any(w in q for w in ["soil","organic","compost","fertilizer","biochar","mulch","nutrients",
+                             "nitrogen","ph","sandy","clay"]):
+        recs = "\n".join(f"- {r}" for r in soil.get("recommendations", []))
+        return f"**Soil recommendations for {city}** ({kz}):\n{recs}"
+
+    if any(w in q for w in ["population","density","urban","miyawaki","green space","greening",
+                             "who","per capita","residents"]):
+        u = last.get("urban", {})
+        return (f"**Urban greening for {city}**: {u.get('classification','?')} "
+                f"({ctx.get('population_density',0):,}/km²)\n"
+                f"WHO green-space deficit: **{u.get('required_green_ha_per_km2','?')} ha/km²** to meet 9 m²/capita norm\n"
+                f"**Greening options (no displacement)**: {'; '.join(u.get('greening_without_displacement',[])[:4])}\n"
+                f"**Dense-urban toolkit**: {'; '.join(u.get('dense_urban_toolkit',[])[:3])}\n"
+                f"**CO2 context**: {u.get('co2_honesty_note','')}")
+
+    # Generic — give full at-a-glance snapshot
+    return (f"**{city} snapshot** ({kz}, AQI {ctx.get('aqi',{}).get('score')} "
+            f"{ctx.get('aqi',{}).get('category')}):\n"
+            f"- 🌡 {ctx.get('temperature_avg')}°C avg, {ctx.get('humidity_avg')}% RH, "
+            f"feels {ctx.get('heat_index_avg')}°C\n"
+            f"- 💧 {water.get('annual_rainfall_mm')} mm/yr rain — stress: {water.get('stress_level','?')}\n"
+            f"- ⚡ Solar {energy.get('solar_kwh_m2_day')} kWh/m²/d, wind {energy.get('wind_ms')} m/s\n"
+            f"- 🌳 {carbon.get('trees_modelled',0):,} trees modelled → "
+            f"{carbon.get('cumulative_tonnes_co2e',{}).get('year_10',0):,} t CO2 in 10 yr\n\n"
+            "Ask about: **tree species · water · solar energy · air quality · carbon · soil · urban greening**")
+
+
 def ask_followup(question: str) -> str:
-    """Free-form Q&A: hybrid RAG retrieval + last pipeline context + LLM."""
-    chunks = retrieve(question, 4)
-    ctx = getattr(ask_ecogpt, "last", {}).get("ctx")
-    evidence = "\n\n".join(f"[{c['source']} | rel {c['relevance']}]\n{c['text']}" for c in chunks)
+    """Free-form Q&A: hybrid RAG retrieval + last pipeline context + LLM.
+    Deterministic fallback synthesises location-aware answers without an LLM."""
+    try:
+        chunks = retrieve(question, 5)
+    except Exception:
+        chunks = []
+    last = getattr(ask_ecogpt, "last", {})
+    ctx  = last.get("ctx")
+    evidence = "\n\n".join(
+        f"[{c['source']} | rel {c['relevance']}]\n{c['text']}" for c in chunks)
     if LLM.kind != "none":
-        ans = LLM.generate(
-            "You are EcoGPT, an environmental advisory assistant. Answer ONLY from the evidence and "
-            "context provided. Cite sources inline. If the evidence is insufficient, say so explicitly.",
-            f"Context: {json.dumps(ctx, default=str)[:1500] if ctx else 'none yet'}\n\n"
-            f"Evidence:\n{evidence}\n\nQuestion: {question}")
-        if ans: return ans
-    # deterministic fallback: return best evidence verbatim
-    return ("**Most relevant knowledge found:**\n\n" +
-            "\n\n".join(f"**{c['source']}** (relevance {c['relevance']}):\n{c['text'][:600]}…"
-                        for c in chunks[:2]) +
-            "\n\n*(Connect Ollama or set HF_TOKEN for synthesized answers.)*")
+        try:
+            ans = LLM.generate(
+                "You are EcoGPT, an environmental advisory assistant. Answer ONLY from the evidence and "
+                "context provided. Cite sources inline. If evidence is insufficient say so explicitly.",
+                f"Context: {json.dumps(ctx, default=str)[:1500] if ctx else 'none yet'}\n\n"
+                f"Evidence:\n{evidence}\n\nQuestion: {question}")
+            if ans: return ans
+        except Exception:
+            pass
+
+    # --- deterministic fallback ---
+    if ctx and last:
+        return _followup_from_context(question, ctx, last)
+
+    # No location run yet — surface the best raw chunks
+    good = [c for c in chunks if c.get("relevance", 0) > 0.001 and c.get("source") != "none"]
+    if good:
+        parts = ["**Relevant knowledge base entries:**\n"]
+        for c in good[:3]:
+            parts.append(f"**{c['source']}**:\n{c['text'][:600]}…\n")
+        parts.append("\n*Run a location analysis first for context-specific answers. "
+                     "Set HF_TOKEN or start Ollama for AI-synthesized responses.*")
+        return "\n\n".join(parts)
+
+    return ("No relevant knowledge found for that question.\n"
+            "Try asking about: **tree species · water harvesting · air pollution · solar energy · "
+            "soil · carbon sequestration · urban greening**.\n"
+            "Run a location analysis first to get answers specific to your chosen site.")
 
 # ---------- Google ADK wiring (used when google-adk is installed) ----------
 ADK_READY = False
