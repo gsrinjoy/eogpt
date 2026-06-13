@@ -713,7 +713,7 @@ def reverse_geocode(lat: float, lon: float) -> dict:
                         "climate_zone": get_climate_zone(lat, lon), "geocoder": "nominatim"}
         except Exception:
             pass
-    best, bd = "Unknown", 1e9
+    best, bd, country = "Unknown", 1e9, "Unknown"   # initialise country to avoid UnboundLocalError
     for name,(la,lo,co,kz,pd_,rain) in GAZETTEER.items():
         d = ((lat-la)**2+(lon-lo)**2)**0.5
         if d < bd: best, bd, country = name.title(), d, co
@@ -737,14 +737,20 @@ def geocode_city(name: str):
 def get_open_spaces(lat: float, lon: float, radius_m: int = 3000) -> list:
     """REAL plantable-land lookup via OpenStreetMap Overpass API:
     parks, meadows, brownfields, vacant/green land + water bodies near the point.
+    Includes OSM relations (multipolygon parks, large rivers stored as relation).
     Returns [{name, kind, coords[(lat,lon)…], area_m2, tree_capacity}]. [] offline."""
-    q = f"""[out:json][timeout:25];(
+    q = f"""[out:json][timeout:30];(
       way["leisure"~"park|recreation_ground|garden|pitch"](around:{radius_m},{lat},{lon});
+      relation["leisure"~"park|recreation_ground|garden"](around:{radius_m},{lat},{lon});
       way["landuse"~"grass|meadow|brownfield|greenfield|village_green|recreation_ground|cemetery|allotments"](around:{radius_m},{lat},{lon});
+      relation["landuse"~"grass|meadow|brownfield|greenfield|village_green|recreation_ground"](around:{radius_m},{lat},{lon});
       way["natural"~"^water$|wetland|scrub|grassland"](around:{radius_m},{lat},{lon});
+      relation["natural"~"^water$|wetland"](around:{radius_m},{lat},{lon});
       way["waterway"~"^river$|^stream$|^canal$|riverbank"](around:{radius_m},{lat},{lon});
+      relation["waterway"~"riverbank"](around:{radius_m},{lat},{lon});
       way["water"~"river|lake|pond|reservoir"](around:{radius_m},{lat},{lon});
-    );out geom 160;"""
+      relation["water"~"river|lake|pond|reservoir"](around:{radius_m},{lat},{lon});
+    );out geom 400;"""
     try:
         r = _rq_get_post("https://overpass-api.de/api/interpreter", q)
         elements = r.json().get("elements", [])
@@ -752,12 +758,31 @@ def get_open_spaces(lat: float, lon: float, radius_m: int = 3000) -> list:
         return []
     out = []
     for el in elements:
-        geom = el.get("geometry") or []
         tags = el.get("tags", {})
+        el_type = el.get("type", "way")
+
+        # ── Geometry extraction ──────────────────────────────
+        if el_type == "relation":
+            # Relations store geometry in members; use the first outer member
+            geom = []
+            for member in el.get("members", []):
+                if member.get("role") in ("outer", "") and member.get("geometry"):
+                    geom = member["geometry"]; break
+            # Fallback: concatenate all outer member geometries
+            if not geom:
+                for member in el.get("members", []):
+                    if member.get("geometry"):
+                        geom = member["geometry"]; break
+        else:
+            geom = el.get("geometry") or []
         coords = [(p["lat"], p["lon"]) for p in geom]
-        if tags.get("waterway"):           # RIVERS/STREAMS/CANALS — linear features
+
+        # ── Classify waterway features ───────────────────────
+        waterway_tag = tags.get("waterway", "")
+        if waterway_tag and waterway_tag != "riverbank":
+            # LINEAR waterway: river centreline, stream, canal
             if len(coords) < 2: continue
-            out.append({"name": tags.get("name", tags["waterway"].title()),
+            out.append({"name": tags.get("name", waterway_tag.replace("_", " ").title()),
                         "kind": "river", "coords": coords, "area_m2": 0,
                         "tree_capacity": 0,
                         "length_km": round(sum(
@@ -765,17 +790,32 @@ def get_open_spaces(lat: float, lon: float, radius_m: int = 3000) -> list:
                              (coords[i][1]-coords[i+1][1])**2)**0.5
                             for i in range(len(coords)-1)) * 111, 2)})
             continue
+        # riverbank falls through to polygon processing below as kind="water"
+
+        # ── Polygon features (parks, water bodies, riverbanks) ──
         if len(coords) < 4: continue
-        kind = ("water" if (tags.get("natural") in ("water", "wetland") or tags.get("water"))
+        kind = ("water" if (tags.get("natural") in ("water", "wetland")
+                            or tags.get("water")
+                            or waterway_tag == "riverbank")   # riverbank = water area
                 else "open")
         area = _poly_area_m2(coords)
         if area < 400: continue            # skip tiny slivers
-        out.append({"name": tags.get("name", tags.get("landuse") or tags.get("leisure")
-                    or tags.get("natural") or tags.get("water") or "unnamed plot"),
-                    "kind": kind, "coords": coords, "area_m2": int(area),
+        name = (tags.get("name")
+                or tags.get("landuse") or tags.get("leisure")
+                or tags.get("natural") or tags.get("water")
+                or (waterway_tag.replace("_"," ").title() if waterway_tag else None)
+                or "unnamed plot")
+        out.append({"name": name, "kind": kind, "coords": coords,
+                    "area_m2": int(area),
                     "tree_capacity": 0 if kind == "water" else int(area/25)})  # 1 tree/25 m²
+    # sort by area (largest first), deduplicate by name+kind
     out.sort(key=lambda s: -s["area_m2"])
-    return out[:80]
+    seen, deduped = set(), []
+    for s in out:
+        key = (s["name"], s["kind"])
+        if key not in seen:
+            seen.add(key); deduped.append(s)
+    return deduped[:80]
 
 def _rq_get_post(url, data):
     import requests as _r

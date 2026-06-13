@@ -285,8 +285,10 @@ with tab_charts:
         fig, a = plt.subplots(figsize=(6, 3))
         fig.patch.set_facecolor(_C["bg"]); a.set_facecolor(_C["panel"])
         base_n = carbon["trees_modelled"]
+        survey_area_ha = math.pi * radius_km ** 2 * 100
         scen = [(base_n,5),(base_n*3,10),(base_n*6,25)]
-        sims = [core.simulate_intervention(aqi, n, n/plant["trees_per_hectare"], y)
+        sims = [core.simulate_intervention(aqi, n, n/plant["trees_per_hectare"], y,
+                                           urban_area_ha=survey_area_ha)
                 for n, y in scen]
         lbl6 = [(f"{n//1000}k trees\n{y} yrs" if n>=1000
                  else f"{n} trees\n{y} yrs") for n, y in scen]
