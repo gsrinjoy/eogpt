@@ -158,59 +158,167 @@ with tab_map:
 # ───────────────────────── charts ─────────────────────────
 with tab_charts:
     import matplotlib.pyplot as plt
+    import numpy as np
     import math as _math
-    GRN, RED, BLU, ORG, GRY = "#2e7d32", "#c62828", "#1565c0", "#ef6c00", "#9e9e9e"
-    plt.rcParams.update({"axes.grid": True, "grid.alpha": .25,
-                         "axes.spines.top": False, "axes.spines.right": False})
+
+    # ── Modern EcoGPT palette ─────────────────────────────
+    _C = dict(
+        green      = "#2e7d32", green_lt = "#4caf50", green_pale = "#c8e6c9",
+        red        = "#c62828", blue     = "#1565c0", blue_lt    = "#90caf9",
+        orange     = "#e65100", orange_lt= "#ffb74d",
+        grey       = "#bdbdbd", grey_dk  = "#616161",
+        bg         = "#f4f8f5", panel    = "#ffffff",
+        title      = "#1b5e20", text     = "#424242", text_lt    = "#9e9e9e",
+    )
+    plt.rcParams.update({
+        "figure.facecolor"  : _C["bg"],   "axes.facecolor"    : _C["panel"],
+        "axes.edgecolor"    : "#e0e0e0",  "axes.linewidth"    : 0.8,
+        "axes.spines.top"   : False,      "axes.spines.right" : False,
+        "axes.spines.left"  : False,      "axes.grid"         : True,
+        "axes.grid.axis"    : "y",        "grid.color"        : "#efefef",
+        "grid.linewidth"    : 0.9,        "axes.titlesize"    : 10,
+        "axes.titleweight"  : "bold",     "axes.titlecolor"   : _C["title"],
+        "axes.labelsize"    : 8.5,        "xtick.labelsize"   : 8,
+        "ytick.labelsize"   : 8,          "xtick.color"       : _C["text_lt"],
+        "ytick.color"       : _C["text_lt"], "legend.frameon"  : False,
+        "font.family"       : "sans-serif",
+    })
+
+    def _lbl_st(a, bars, fmt="{:.1f}", fs=8.5):
+        ymax = max((b.get_height() for b in bars), default=1) or 1
+        for b in bars:
+            h = b.get_height()
+            if h != h or h == 0: continue
+            a.text(b.get_x()+b.get_width()/2, h+ymax*0.035,
+                   fmt.format(h), ha="center", va="bottom",
+                   fontsize=fs, color=_C["text"], fontweight="bold")
+
     s_ = ctx["stats"]; gm = lambda c: s_.get(c, {}).get("mean", float("nan"))
     c1, c2 = st.columns(2)
+
     with c1:
-        fig, a = plt.subplots(figsize=(6, 2.2)); left = 0
-        for ceil_, col in [(50,"#00e400"),(100,"#ffff00"),(150,"#ff7e00"),
-                           (200,"#ff0000"),(300,"#8f3f97"),(400,"#7e0023")]:
-            a.barh(0, ceil_-left, left=left, color=col, height=.45); left = ceil_
-        a.axvline(min(aqi, 400), color="black", lw=4)
-        a.set(xlim=(0,400), yticks=[], title=f"AQI {aqi} — {ctx['aqi']['category']}")
-        st.pyplot(fig, use_container_width=True)
+        # ── AQI gauge ──────────────────────────────────
+        fig, a = plt.subplots(figsize=(6, 2.4))
+        fig.patch.set_facecolor(_C["bg"]); a.set_facecolor(_C["panel"])
+        bands = [(50,"#57d98f"),(100,"#ffe566"),(150,"#ff9a3c"),
+                 (200,"#ff4a4a"),(300,"#b05fcc"),(400,"#7e0023")]
+        left = 0
+        for ceil_, col in bands:
+            a.barh(0, ceil_-left, left=left, color=col, height=0.44, edgecolor="none")
+            left = ceil_
+        nv = min(aqi, 400)
+        a.axvline(nv, color="#212121", lw=3.5, zorder=5)
+        a.scatter([nv], [0.28], color="#212121", s=70, zorder=6, clip_on=False)
+        for cx, cl in [(25,"Good"),(75,"Moderate"),(125,"USG"),(175,"Unhealthy"),
+                       (250,"V.Unhealthy"),(350,"Hazardous")]:
+            a.text(cx, -0.28, cl, ha="center", va="top", fontsize=5.5, color=_C["grey_dk"])
+        a.text(nv, 0.5, f"  {aqi}  \n{ctx['aqi']['category']}",
+               ha="center", va="bottom", fontsize=9, fontweight="bold", color=_C["title"],
+               bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                         edgecolor=_C["green_pale"], linewidth=1))
+        a.set(xlim=(0,400), ylim=(-0.5,0.85), yticks=[])
+        a.spines["bottom"].set_visible(False); a.spines["left"].set_visible(False)
+        a.grid(False); a.set_title("Air Quality Index", pad=4)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
 
-        fig, a = plt.subplots(figsize=(6, 3))
+        # ── Pollution vs WHO ────────────────────────────
+        fig, a = plt.subplots(figsize=(6, 3.2))
+        fig.patch.set_facecolor(_C["bg"]); a.set_facecolor(_C["panel"])
         vals = [gm("RAWPM"), gm("DD"), gm("NO2")*1880, gm("CO")*1.145]
-        who = [15, 45, 25, 4]
-        ratio = [v/w if v == v else 0 for v, w in zip(vals, who)]
-        a.bar(["PM2.5","PM10","NO2","CO"], ratio,
-              color=[RED if r > 1 else GRN for r in ratio])
-        a.axhline(1, color="black", ls="--"); a.set(title="Pollution vs WHO limits (× limit)")
-        st.pyplot(fig, use_container_width=True)
+        who  = [15, 45, 25, 4]
+        ratio = [v/w if (v==v and w) else 0 for v, w in zip(vals, who)]
+        b2 = a.bar(["PM₂.₅","PM₁₀","NO₂","CO"], ratio,
+                   color=[_C["red"] if r>1 else _C["green_lt"] for r in ratio],
+                   edgecolor="none", width=0.6, zorder=3)
+        a.axhspan(0, 1, alpha=0.07, color=_C["green"], zorder=0)
+        a.axhline(1, color=_C["grey_dk"], ls="--", lw=1.5, zorder=4)
+        a.text(3.46, 1.06, "WHO limit", fontsize=7.5, color=_C["grey_dk"])
+        rmax = max(ratio or [0.1]) or 0.1
+        for b, v, r in zip(b2, vals, ratio):
+            if v==v and v:
+                a.text(b.get_x()+b.get_width()/2, r+rmax*0.05,
+                       f"{v:.0f}\n({r:.1f}×)", ha="center", va="bottom",
+                       fontsize=7.5, color=_C["red"] if r>1 else _C["green"],
+                       fontweight="bold")
+        a.set(title="Pollutants vs WHO 24-h guideline", ylabel="× WHO limit")
+        a.yaxis.grid(True, color="#efefef", zorder=0)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
 
+        # ── Heat island ─────────────────────────────────
         fig, a = plt.subplots(figsize=(6, 3))
+        fig.patch.set_facecolor(_C["bg"]); a.set_facecolor(_C["panel"])
         d_ = ctx["heat_index_avg"] - ctx["temperature_avg"]
-        a.bar(["Air temp","Feels like"], [ctx["temperature_avg"], ctx["heat_index_avg"]],
-              color=[GRY, RED if d_ > 3 else ORG])
-        a.set(title=f"Heat island: +{d_:.1f}°C", ylabel="°C")
-        st.pyplot(fig, use_container_width=True)
+        b5 = a.bar(["Air temperature", "Feels like\n(heat index)"],
+                   [ctx["temperature_avg"], ctx["heat_index_avg"]],
+                   color=[_C["grey"], _C["red"] if d_>3 else _C["orange"]],
+                   edgecolor="none", width=0.45, zorder=3)
+        _lbl_st(a, b5, "{:.1f}°C", fs=9.5)
+        hi = ctx["heat_index_avg"]
+        a.annotate(f"+{d_:.1f}°C",
+                   xy=(1, hi), xytext=(0.35, hi+max(hi*0.07, 1.5)),
+                   arrowprops=dict(arrowstyle="->", color=_C["red"], lw=1.3),
+                   fontsize=9, color=_C["red"], fontweight="bold", ha="center")
+        a.set(title=f"Heat island — +{d_:.1f}°C feels-like", ylabel="°C")
+        a.yaxis.grid(True, color="#efefef", zorder=0)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
+
     with c2:
-        fig, a = plt.subplots(figsize=(6, 3))
-        yrs = [1,5,10,25]; vv = [carbon["cumulative_tonnes_co2e"][f"year_{y}"] for y in yrs]
-        a.plot(yrs, vv, "o-", color=GRN, lw=2.5); a.fill_between(yrs, vv, alpha=.18, color=GRN)
-        a.set(title=f"CO2 capture, {carbon['trees_modelled']:,} trees (t)", xlabel="year")
-        st.pyplot(fig, use_container_width=True)
+        # ── CO₂ projection ──────────────────────────────
+        fig, a = plt.subplots(figsize=(6, 3.2))
+        fig.patch.set_facecolor(_C["bg"]); a.set_facecolor(_C["panel"])
+        yrs = [1,5,10,25]
+        vv  = [carbon["cumulative_tonnes_co2e"][f"year_{y}"] for y in yrs]
+        a.fill_between(yrs, vv, color=_C["green"], alpha=0.12, zorder=1)
+        a.plot(yrs, vv, "-", color=_C["green"], lw=2.5, zorder=3)
+        a.scatter(yrs, vv, color="white", s=55, zorder=4,
+                  edgecolors=_C["green"], linewidths=2)
+        for x, y in zip(yrs, vv):
+            a.annotate(f"{y:,.0f} t", (x, y),
+                       textcoords="offset points", xytext=(0,9),
+                       ha="center", fontsize=8, color=_C["green"], fontweight="bold")
+        a.set(title=f"CO₂ captured — {carbon['trees_modelled']:,} trees",
+              xlabel="Years after planting", ylabel="Cumulative t CO₂e")
+        a.set_xticks(yrs); a.yaxis.grid(True, color="#efefef", zorder=0)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
 
+        # ── What-if AQI ─────────────────────────────────
         fig, a = plt.subplots(figsize=(6, 3))
-        base_n = carbon["trees_modelled"]   # from actual OSM open-space survey, not a hardcoded constant
+        fig.patch.set_facecolor(_C["bg"]); a.set_facecolor(_C["panel"])
+        base_n = carbon["trees_modelled"]
         scen = [(base_n,5),(base_n*3,10),(base_n*6,25)]
-        sims = [core.simulate_intervention(aqi, n, n/plant["trees_per_hectare"], y) for n, y in scen]
-        lbl = [f"{n//1000}k/{y}y" if n >= 1000 else f"{n}/{y}y" for n, y in scen]
-        a.bar(lbl, [aqi]*3, color=GRY, label="today")
-        a.bar(lbl, [x["projected_aqi"] for x in sims], color=GRN, label="projected")
-        a.legend(); a.set(title="What-if: plantation scenarios → AQI")
-        st.pyplot(fig, use_container_width=True)
+        sims = [core.simulate_intervention(aqi, n, n/plant["trees_per_hectare"], y)
+                for n, y in scen]
+        lbl6 = [(f"{n//1000}k trees\n{y} yrs" if n>=1000
+                 else f"{n} trees\n{y} yrs") for n, y in scen]
+        x6 = np.arange(len(scen)); w6 = 0.34
+        a.bar(x6-w6/2, [aqi]*len(scen), w6,
+              color=_C["grey"], alpha=0.65, edgecolor="none", label="Today")
+        a.bar(x6+w6/2, [s["projected_aqi"] for s in sims], w6,
+              color=_C["green_lt"], edgecolor="none", label="Projected")
+        for i, s_ in enumerate(sims):
+            a.text(x6[i]+w6/2, s_["projected_aqi"]+1.5,
+                   f"−{s_['aqi_reduction']}", ha="center", va="bottom",
+                   fontsize=8.5, fontweight="bold", color=_C["green"])
+        a.set_xticks(list(x6)); a.set_xticklabels(lbl6, fontsize=8)
+        a.legend(loc="upper right"); a.set(title="What-if: plantation → AQI impact")
+        a.yaxis.grid(True, color="#efefef", zorder=0)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
 
+        # ── Renewables ───────────────────────────────────
         fig, a = plt.subplots(figsize=(6, 3))
-        a.bar(["Solar kWh/m²/d","Wind m/s"], [energy["solar_kwh_m2_day"], energy["wind_ms"]],
-              color=[ORG, BLU])
-        a.axhline(3.5, color=ORG, ls="--", lw=1); a.axhline(4.0, color=BLU, ls=":", lw=1)
+        fig.patch.set_facecolor(_C["bg"]); a.set_facecolor(_C["panel"])
+        b_rv = a.bar(["Solar\n(kWh/m²/d)", "Wind\n(m/s)"],
+                     [energy["solar_kwh_m2_day"], energy["wind_ms"]],
+                     color=[_C["orange"], _C["blue"]],
+                     edgecolor="none", width=0.45, zorder=3)
+        a.axhline(3.5, xmin=0.05, xmax=0.47, color=_C["orange"], ls="--", lw=1.4)
+        a.axhline(4.0, xmin=0.53, xmax=0.95, color=_C["blue"],   ls="--", lw=1.4)
+        a.text(-0.33, 3.62, "≥3.5 viable", fontsize=8, color=_C["orange"])
+        a.text( 0.67, 4.12, "≥4.0 viable", fontsize=8, color=_C["blue"])
+        _lbl_st(a, b_rv, "{:.2f}", fs=10)
         a.set(title="Renewable resources vs viability thresholds")
-        st.pyplot(fig, use_container_width=True)
+        a.yaxis.grid(True, color="#efefef", zorder=0)
+        st.pyplot(fig, use_container_width=True); plt.close(fig)
 
 # ───────────────────────── energy ─────────────────────────
 with tab_energy:
