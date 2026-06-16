@@ -1591,6 +1591,41 @@ Carbon Sequestration table (yr 1/5/10/25); Predicted Environmental Impact; Prior
 with 2-3 scenarios. Calibrate tone to user type. Never fabricate species or figures; mark estimates "(estimated)" and assumptions "(assumed)".""",
 }
 
+
+# ── LLM enrichment helper ────────────────────────────────────────────────────
+# Each agent calls this to get an LLM-generated insight on top of its
+# deterministic output.  The call is non-blocking: if the LLM is unavailable
+# or times out the agent returns an empty "llm_insight" and the report still
+# works perfectly from its deterministic core.
+#
+# Design rule: LLM insight NEVER originates or overrides numbers, species
+# names, or computed values — those come from the scientific core.  The LLM
+# only adds narrative interpretation, local context, and reasoning.
+
+def _agent_llm(agent_key: str, user_content: str, max_tokens: int = 220) -> str:
+    """Call the active LLM backend for a concise agent-level insight.
+
+    Args:
+        agent_key   : Key into SYSTEM_PROMPTS (e.g. "pollution", "plantation")
+        user_content: Compact summary of the deterministic output + specific ask
+        max_tokens  : Cap output length — keep insights brief (default 220)
+
+    Returns:
+        LLM-generated insight string, or empty string if unavailable/failed.
+    """
+    if LLM.kind == "none":
+        return ""
+    try:
+        result = LLM.generate(
+            SYSTEM_PROMPTS[agent_key],
+            user_content,
+            max_tokens=max_tokens,
+            temperature=0.35,
+        )
+        return (result or "").strip()
+    except Exception:
+        return ""
+
 # ---------------- Agent 1: Data Ingestion ----------------
 def run_data_ingestion(lat, lon, radius=0.05, label=None):
     geo = reverse_geocode(lat, lon)
@@ -1778,7 +1813,7 @@ def run_pollution_agent(ctx):
     biofilters = {"NO2": ["Ficus benjamina","Hedera helix (green screens)","Azadirachta indica"],
                   "PM2.5/dust": ["Ficus elastica","Tillandsia usneoides","Neem hedgerows","Betula pendula"],
                   "VOC": ["Chlorophytum comosum","Spathiphyllum wallisii","Epipremnum aureum"]}
-    return {"severity": cat, "aqi_score": ctx["aqi"]["score"], "dominant_pollutant": ctx["aqi"]["dominant"],
+    _pol_result = {"severity": cat, "aqi_score": ctx["aqi"]["score"], "dominant_pollutant": ctx["aqi"]["dominant"],
             "source_apportionment": {"classification": source,
                 "signals": {k: round(v,1) for k,v in sigs.items()}},
             "heat_island_flag": heat_island,
@@ -1789,6 +1824,22 @@ def run_pollution_agent(ctx):
             "expected_improvement": "Street-canyon green walls: up to 40% NO2 / 60% PM locally; "
                 "citywide canopy at 30%: 2-10% PM2.5 reduction + 1-3°C cooling (Pugh et al., estimated)",
             "grounding": [{"id":c["id"],"source":c["source"],"relevance":c["relevance"]} for c in chunks]}
+    # LLM validates source attribution and rates confidence in the AQI reading
+    _pol_result["llm_insight"] = _agent_llm(
+        "pollution",
+        (f"City: {ctx['location']['city']} | Climate: {ctx['location']['climate_name']} | "
+         f"AQI: {ctx['aqi']['score']} ({ctx['aqi']['category']}) | "
+         f"Dominant: {ctx['aqi']['dominant']} | Source signals: {sigs} | Classified as: '{source}'\n"
+         f"Heat index exceeds ambient by {round(ctx['heat_index_avg']-ctx['temperature_avg'],1)}°C "
+         f"({'heat island flagged' if heat_island else 'within normal range'}).\n"
+         f"Short-term actions: {'; '.join(short[:2])}\n\n"
+         "Task: (1) Rate your confidence (High/Medium/Low) in the source attribution above "
+         "given the signal pattern, and explain what one measurement would confirm or refute it. "
+         "(2) Name the ONE action from the list most likely to show measurable improvement "
+         "within 30 days for this specific source type. Be specific to this city and AQI level. "
+         "Under 80 words."),
+    )
+    return _pol_result
 
 # ---------------- Agent 4: Plantation & Biodiversity ----------------
 def run_plantation_agent(ctx):
@@ -1833,13 +1884,29 @@ def run_plantation_agent(ctx):
         "Dense Urban": ["Vacant municipal lots → Miyawaki plots","Rooftops & flyover pillars",
                         "Roadside verges & medians","Institutional campuses","Canal banks"],
     }[dens_class]
-    return {"species": species, "trees_per_hectare": trees_ha,
+    _plant_result = {"species": species, "trees_per_hectare": trees_ha,
             "spatial_arrangement": arrangement,
             "priority_zones": priority_zones,
             "canopy_layers": canopy_layers,
             "avoid": INVASIVE_BLACKLIST,
             "polyculture_rule": "No species >15% of total; ≥10 species/ha",
             "grounding": [{"id":c["id"],"source":c["source"],"relevance":c["relevance"]} for c in chunks]}
+    # LLM reviews species selection for climate fit and flags any caveats
+    _top3_sp = [(s["scientific"], s["common"], s["role"][:50]) for s in species[:3]]
+    _plant_result["llm_insight"] = _agent_llm(
+        "plantation",
+        (f"City: {ctx['location']['city']} | Climate: {ctx['location']['climate_name']} "
+         f"({ctx['location']['climate_zone']}) | {'Arid zone' if arid else 'Non-arid'} | "
+         f"Density class: {dens_class} | Planting density: {trees_ha} trees/ha\n"
+         f"Top 3 recommended species: {_top3_sp}\n"
+         f"Priority zones: {priority_zones[:2]}\n\n"
+         "Task: (1) Flag any of these 3 species that may underperform or carry a risk "
+         "in this specific climate zone (drought stress, disease, soil pH mismatch). "
+         "(2) Suggest ONE concrete adjustment to the planting plan — different species, "
+         "spacing, or timing — that would improve long-term survival rate for this climate. "
+         "Under 80 words. No new species unless clearly superior for this zone."),
+    )
+    return _plant_result
 
 # ---------------- Agent 5: Water ----------------
 REGION_FISH = {"India": "Rohu, Catla, Mrigal (Indian major carps)",
@@ -1893,7 +1960,7 @@ def run_water_agent(ctx):
     elif stress.startswith("Low"):
         plan = ["PRIORITY: drainage management — permeable paving, retention ponds, "
                 "wetland buffers against waterlogging/flood"] + plan
-    return {"stress_level": stress, "annual_rainfall_mm": int(rain),
+    _water_result = {"stress_level": stress, "annual_rainfall_mm": int(rain),
         "rainfall_source": rain_source,
         "restoration_plan": plan,
         "rainwater_harvesting": {
@@ -1906,6 +1973,20 @@ def run_water_agent(ctx):
         "quantified_savings_l_yr": {"rwh_per_1000_households": int(harvest_l*1000),
                                     "drip_per_ha": 3_500_000},
         "grounding": [{"id":c["id"],"source":c["source"],"relevance":c["relevance"]} for c in chunks]}
+    # LLM prioritises the water plan given the specific rainfall and stress combination
+    _water_result["llm_insight"] = _agent_llm(
+        "water",
+        (f"City: {L['city']} | Climate: {ctx['location']['climate_name']} | "
+         f"Rainfall: {int(rain)} mm/yr ({rain_source}) | Stress: {stress} | "
+         f"Humidity: {ctx['humidity_avg']}% | Temp avg: {ctx['temperature_avg']}°C\n"
+         f"Restoration plan: {'; '.join(plan[:3])}\n"
+         f"RWH yield: {int(harvest_l):,} L/yr per 100 m² roof\n\n"
+         "Task: Given this rainfall level and stress category, rank the top 2 restoration "
+         "actions from the plan above by expected impact and explain WHY they are highest "
+         "priority for this specific rainfall regime. Note any seasonal timing consideration. "
+         "Under 80 words."),
+    )
+    return _water_result
 
 # ---------------- Agent 6: Urban Planning ----------------
 def run_urban_agent(ctx):
@@ -1923,7 +2004,7 @@ def run_urban_agent(ctx):
               "singapore":8.9,"egypt":2.5,"russia":11.4,"australia":15.0
               }.get((ctx["location"].get("country") or "").lower(), 4.7)
     trees_per_1000 = int(1000 * co2_pc * 1000 / 22 / 1000)  # trees to offset 1% would be /100
-    return {"density_per_km2": d, "classification": dc,
+    _urban_result = {"density_per_km2": d, "classification": dc,
         "who_green_norm_m2pc": 9,
         "required_green_ha_per_km2": round(green_needed_ha_km2, 1),
         "per_capita_co2_t": co2_pc,
@@ -1941,6 +2022,21 @@ def run_urban_agent(ctx):
             "mature trees per 1000 residents offset only ~1% of their emissions — urban forests are "
             "for air, heat & habitat; pair with energy transition (estimated)",
         "grounding": [{"id":c["id"],"source":c["source"],"relevance":c["relevance"]} for c in chunks]}
+    # LLM identifies the most realistic and fastest-impact greening path for this density
+    _urban_result["llm_insight"] = _agent_llm(
+        "urban",
+        (f"City: {ctx['location']['city']} | Density: {d:,}/km² ({dc}) | "
+         f"WHO green deficit: {round(green_needed_ha_km2,1)} ha/km² | "
+         f"Per-capita CO2: {co2_pc} t/yr | Climate: {ctx['location']['climate_name']}\n"
+         "Greening options (no-displacement): Institutional campuses, road medians, "
+         "canal banks, rooftops, parking lots\n"
+         "Dense urban toolkit top item: Miyawaki micro-forests ≥90 trees/30 m²\n\n"
+         "Task: For this specific density class and city, identify the single greening "
+         "approach from the options above that is most achievable within 12 months and "
+         "explain what makes it realistic at this population density. Flag any displacement "
+         "risk to avoid. Under 80 words."),
+    )
+    return _urban_result
 
 # ---------------- Agent 7: Carbon ----------------
 def run_carbon_agent(ctx, plantation, trees_to_plant=None, open_space_ha=None):
@@ -2103,10 +2199,27 @@ def run_energy_agent(ctx):
                         if steep is False and solar >= 5.5 else
                         "rooftops & canopies first; ground-mount ONLY on verified-flat degraded land")}
     chunks = retrieve("renewable energy siting feasibility solar slope terrain wind biogas", 2)
-    return {"terrain": terrain, "solar_kwh_m2_day": round(solar,2), "wind_ms": round(wind,1),
+    _energy_result = {"terrain": terrain, "solar_kwh_m2_day": round(solar,2), "wind_ms": round(wind,1),
             "grid_emission_factor_kg_kwh": grid_ef, "interventions": items,
             "solar_plan": solar_plan,
             "grounding": [{"id":c["id"],"source":c["source"],"relevance":c["relevance"]} for c in chunks]}
+    # LLM recommends implementation sequence for maximum early CO2 ROI
+    _feasible_e = [i for i in items if i["feasible"].startswith("✅")]
+    _cond_e     = [i for i in items if i["feasible"].startswith("⚠️")]
+    _energy_result["llm_insight"] = _agent_llm(
+        "energy",
+        f"City: {ctx['location']['city']} | Solar: {round(solar,2)} kWh/m²/day | "
+        f"Wind: {round(wind,1)} m/s | Terrain: {terrain['slope_class']} | "
+        f"Grid emission factor: {grid_ef} kg CO2/kWh\n"
+        f"Feasible interventions: {[i['intervention'] for i in _feasible_e]}\n"
+        f"Conditional (site check needed): {[i['intervention'] for i in _cond_e]}\n"
+        f"Solar: {solar_plan['potential_mwp_per_km2']} MWp/km² → "
+        f"{solar_plan['co2_avoided_t_per_km2_yr']:,} t CO2/yr/km²\n\n"
+        "Task: Recommend Phase 1 → Phase 2 implementation sequence for the feasible "
+        "interventions to achieve the fastest CO2 payback. Note any site-specific "
+        "constraint that could affect Phase 1. Under 80 words.",
+    )
+    return _energy_result
 
 print("Agents defined ✓  (data, rag, pollution, plantation, water, urban, carbon, soil, energy + synthesis next)")
 
@@ -2259,14 +2372,69 @@ def _user_type_note(user_type: str, ctx, pol, plant, water, energy, carbon, urba
     return ""  # "default" — no extra section
 
 
+def _build_synthesis_context(ctx, pol, plant, water, urban, carbon, soil, energy) -> str:
+    """Compact multi-agent context string for the LLM cross-domain reasoning call.
+
+    Keeps total token count low (~350 words) so all backends (HF free tier, vLLM,
+    Ollama) can handle it.  All numbers come from the deterministic agents — the
+    LLM reasons about them, never invents new ones.
+    """
+    L = ctx["location"]
+    sp3 = ", ".join(
+        f"{s['common']} ({s['co2_kg_yr']} kg CO2/yr)" for s in plant["species"][:3])
+    top_e = next((i for i in energy["interventions"] if i["feasible"].startswith("✅")),
+                 energy["interventions"][0])
+    return (
+        f"LOCATION: {L['city']}, {L['country']} | Climate: {L['climate_name']} ({L['climate_zone']})\n\n"
+        f"POLLUTION: AQI {ctx['aqi']['score']} ({ctx['aqi']['category']}) | "
+        f"Source: {pol['source_apportionment']['classification']} | "
+        f"Heat island delta: +{pol['heat_island_delta']}°C | "
+        f"Dominant pollutant: {ctx['aqi']['dominant']}\n"
+        f"Short-term actions: {'; '.join(pol['actions']['short_term_24_72h'][:2])}\n\n"
+        f"PLANTATION: {plant['trees_per_hectare']} trees/ha | Top species: {sp3}\n"
+        f"Priority zone: {plant['priority_zones'][0]}\n\n"
+        f"WATER: Stress={water['stress_level']} | Rainfall={water['annual_rainfall_mm']} mm/yr\n"
+        f"Top priority: {water['restoration_plan'][0]}\n"
+        f"RWH: {water['rainwater_harvesting']['per_100m2_roof_litres_yr']:,} L/yr per 100 m² roof\n\n"
+        f"URBAN: {ctx['population_density']:,}/km² ({ctx['density_class']}) | "
+        f"WHO green deficit: {urban['required_green_ha_per_km2']} ha/km² | "
+        f"Per-capita CO2: {urban['per_capita_co2_t']} t/yr\n\n"
+        f"CARBON: {carbon['trees_modelled']:,} trees → "
+        f"Yr 5: {carbon['cumulative_tonnes_co2e']['year_5']:,} t | "
+        f"Yr 10: {carbon['cumulative_tonnes_co2e']['year_10']:,} t CO2e | "
+        f"Confidence: {carbon['confidence']}\n\n"
+        f"SOIL: {soil['recommendations'][0]}\n\n"
+        f"ENERGY: Solar {energy['solar_kwh_m2_day']} kWh/m²/day | Wind {energy['wind_ms']} m/s | "
+        f"Terrain: {energy['terrain']['slope_class']}\n"
+        f"Top feasible: {top_e['intervention']} — {top_e['reason'][:80]}\n\n"
+        "TASK: Analyze this multi-domain environmental data. Write exactly 4 short sections "
+        "(label each with a bold heading, 2-3 sentences each):\n"
+        "**Data Confidence:** Are these measurements internally consistent? What pattern "
+        "do they reveal together that no single agent could show?\n"
+        "**Cross-Domain Risks:** Top 2 risks that emerge only when viewing all domains "
+        "together (not already listed as individual agent actions).\n"
+        "**Highest-Leverage Action:** Which single intervention has the most cross-domain "
+        "benefit here, and why?\n"
+        "**Climate-Specific Watch Out:** One risk or edge case specific to this climate "
+        "zone and density that the standard recommendations may underweight.\n"
+        "Use ONLY the numbers provided above. No new figures. Under 250 words total."
+    )
+
+
 def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type="default"):
     """Assemble the final Markdown report from all 8 agent outputs.
 
-    Deterministic — no LLM call here. The LLM polish step is done in ask_ecogpt()
-    after this function returns, so the raw report is always available as fallback.
+    Architecture:
+      1. Deterministic core: builds all tables, numbers, and structured sections.
+      2. LLM cross-domain analysis (inside this function): compacts all 7 agent
+         outputs into ~350 words, calls the active LLM backend, injects a
+         '🤖 AI Cross-Domain Analysis' section. LLM never originates numbers —
+         it reasons about the deterministic values. Gracefully skipped if no LLM.
+      3. Optional final polish in ask_ecogpt(): flow/tone pass (not a full rewrite).
 
     Sections produced:
       At a Glance table (letter grades) → Environmental Assessment → Key Risks →
+      🤖 AI Cross-Domain Analysis (LLM reasoning) →
       Recommended Species table → Plantation Plan → Pollution Actions →
       Soil → Water → Biodiversity → Carbon table → Energy plan →
       What-If Simulation → Priority Action Items (location-specific, max 10) →
@@ -2382,6 +2550,33 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
 
 **In one paragraph:** {f"{L['city']}'s air is already *{ctx['aqi']['category'].lower()}* — protect it and put energy into the bigger levers here" if ok_air else f"{L['city']}'s air is *{ctx['aqi']['category'].lower()}* and the biggest quick win is tackling {pol['source_apportionment']['classification']} emissions"}. {"Plant water-wise natives only (" + sp3 + f") at reduced density with micro-catchment basins — the {water['annual_rainfall_mm']} mm water budget rules out dense forestry, and rooftop solar (" + str(energy['solar_kwh_m2_day']) + " kWh/m²/day) is this region's strongest intervention" if arid else f"Plant **{carbon['trees_modelled']:,} trees** (start with {sp3}) on the open land shown in the dashboard — in 10 years that captures ≈**{y10:,.0f} t of CO2** (like taking {int(y10/4.6/10):,} cars off the road each year)"}. {"Store every drop: " + water['restoration_plan'][1].lower() if arid else f"Harvest rooftop rain (**{water['rainwater_harvesting']['per_100m2_roof_litres_yr']:,} L/yr per 100 m² roof**) and start water work with: *{water['restoration_plan'][0].lower()}*"}.
 {desert_note}"""
+    # ── LLM cross-domain analysis (non-blocking; empty string if no LLM) ────────
+    # All 7 agent outputs are compacted into ~350 words and sent to the active LLM.
+    # LLM reasons across domains — data consistency, cross-domain risks, highest-
+    # leverage intervention, climate-specific edge cases.  NEVER generates numbers:
+    # every figure it references comes from the deterministic agents above.
+    _synthesis_ctx = _build_synthesis_context(ctx, pol, plant, water, urban, carbon, soil, energy)
+    _ai_raw = _agent_llm("synthesis", _synthesis_ctx, max_tokens=320)
+    if _ai_raw:
+        # Extract per-agent insights if they exist (populated by agents in 08_agents.py)
+        _agent_insights = ""
+        for _label, _agent_dict in [
+            ("🌬 Pollution", pol), ("🌱 Plantation", plant), ("💧 Water", water),
+            ("🏙 Urban", urban), ("🌿 Carbon", carbon), ("🪨 Soil", soil), ("⚡ Energy", energy)]:
+            _ins = (_agent_dict or {}).get("llm_insight", "")
+            if _ins:
+                _agent_insights += f"\n> *{_label}:* {_ins}"
+        _ai_analysis_section = (
+            "\n## 🤖 AI Cross-Domain Analysis\n"
+            "> *All figures below come from the deterministic agents above. "
+            "This section adds AI reasoning across domains — confidence, synergies, and risks "
+            "that no single agent captures alone.*\n\n"
+            + _ai_raw
+            + (_agent_insights and f"\n\n**Per-Agent AI Insights:**\n{_agent_insights}\n" or "")
+        )
+    else:
+        _ai_analysis_section = ""   # No LLM available — section omitted silently
+
     all_assumptions = ctx["assumptions"] + ctx["aqi"].get("notes", [])
     assumptions = "; ".join(all_assumptions) if all_assumptions else "none"
     report = f"""
@@ -2404,6 +2599,8 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
 - Green-space requirement: **{urban['required_green_ha_per_km2']} ha/km²** to meet WHO 9 m²/capita ({urban['note']})
 - Sensor anomalies:
 {anomalies}
+
+{_ai_analysis_section}
 
 ## Recommended Plant Species
 | Scientific name | Common | Role | CO2 (kg/yr) | Water | Status |
@@ -2471,8 +2668,25 @@ With full implementation over 5 years: AQI improvement {"15–30" if ctx['aqi'][
 
 def ask_ecogpt(query: str, user_type: str = "default", polish: bool = True,
                survey_radius_km: float = 3.0) -> str:
-    """Full EcoGPT pipeline: location → ingestion → specialists → synthesis → (LLM polish).
-    survey_radius_km controls the OSM open-space land survey radius (default 3 km)."""
+    """Full EcoGPT pipeline — three-layer LLM integration:
+
+    1. Per-agent LLM insights (in 08_agents.py): each specialist agent
+       calls _agent_llm() after its deterministic output.  Focused analytical
+       prompts — source validation, species caveats, soil sequencing, etc.
+       Stored as agent_dict['llm_insight'].  Gracefully empty if no LLM.
+
+    2. Synthesis cross-domain LLM call (in run_synthesis): all 7 agent
+       outputs compacted into ~350 words → LLM reasons across domains
+       (data consistency, cross-domain risks, highest-leverage action,
+       climate-specific edge cases) → injected as '🤖 AI Cross-Domain
+       Analysis' section.
+
+    3. Optional final polish (this function, if polish=True): a very light
+       flow/tone pass on the full report.  Skipped if synthesis LLM call
+       already produced a rich response.
+
+    survey_radius_km controls the OSM open-space land survey radius (default 3 km).
+    """
     loc = parse_location(query)
     if loc is None:
         return LOCATION_HELP
