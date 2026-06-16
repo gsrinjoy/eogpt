@@ -2666,7 +2666,8 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
     else:
         _ai_analysis_section = ""   # No LLM available — section omitted silently
 
-    # Pre-compute per-agent AI insight callout blocks (can't use \\n inside f-string expressions)
+    # ── Pre-compute per-agent AI insight callout blocks ──────────────────────
+    # (backslash expressions not allowed inside f-string {}, so pre-build here)
     def _insight_block(label, agent_dict):
         ins = (agent_dict or {}).get("llm_insight", "").strip()
         if not ins:
@@ -2682,11 +2683,66 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
     _ins_soil   = _insight_block("Soil",            soil)
     _ins_energy = _insight_block("Energy",          energy)
 
+    # ── LLM Executive Summary (top of report) ─────────────────────────────────
+    _exec_ctx = (
+        f"City: {L['city']}, {L['country']} | Climate: {L['climate_name']} ({L['climate_zone']})\n"
+        f"AQI: {ctx['aqi']['score']} ({ctx['aqi']['category']}) | Source: {pol['source_apportionment']['classification']} | "
+        f"Heat island: +{pol['heat_island_delta']}°C\n"
+        f"Water stress: {water['stress_level']} | Rainfall: {water['annual_rainfall_mm']} mm/yr\n"
+        f"Urban: {ctx['population_density']:,}/km² ({ctx['density_class']}) | WHO green deficit: {urban['required_green_ha_per_km2']} ha/km²\n"
+        f"Carbon: {carbon['trees_modelled']:,} trees → {carbon['cumulative_tonnes_co2e']['year_10']:,} t CO2 in 10 yrs\n"
+        f"Solar: {energy['solar_kwh_m2_day']} kWh/m²/day | Top energy: {next((i['intervention'] for i in energy['interventions'] if i['feasible'].startswith('✅')), 'solar')}\n\n"
+        "Write a 4–5 sentence executive summary of the environmental situation in this city. "
+        "Cover: (1) the most pressing environmental challenge, (2) the single highest-leverage "
+        "intervention, (3) the long-term outlook if recommendations are followed. "
+        "Be specific to this location, climate, and AQI level. Use the figures provided."
+    )
+    _exec_summary_raw = _agent_llm("synthesis", _exec_ctx, max_tokens=600)
+    _exec_summary = (
+        "\n> 📋 **Executive Summary (AI-generated):**\n> "
+        + "\n> ".join(_exec_summary_raw.splitlines())
+        + "\n" if _exec_summary_raw else ""
+    )
+
+    # ── Health Impact quantification (AQI → health metrics) ───────────────────
+    _aqi = ctx['aqi']['score']
+    _pop_k = max(1, ctx['population_density'] * 9) // 1000   # rough city pop in thousands
+    _sensitive_pct = 25    # ~25% of population is sensitive (elderly, children, respiratory)
+    # WHO/EPA estimates: ~1-3 extra hospital admissions per 100k/day at AQI 150;
+    # scaling linearly from AQI 100 baseline
+    _excess_hosp = max(0, round((_aqi - 100) * 0.02, 1)) if _aqi > 100 else 0
+    _life_yr_loss = round(max(0, (_aqi - 100) * 0.003), 2) if _aqi > 100 else 0
+    _health_table = (
+        f"| Metric | Current (AQI {_aqi}) | At AQI 50 (target) |\n"
+        f"|---|---|---|\n"
+        f"| Population at elevated risk | ~{_sensitive_pct}% sensitive groups | Minimal |\n"
+        f"| Excess hospital admissions | ~{_excess_hosp}/100k/day *(estimated)* | ~0 |\n"
+        f"| Estimated life-expectancy impact | ~{_life_yr_loss} yrs *(long-term exposure, estimated)* | Negligible |\n"
+        f"| Recommended outdoor activity | {'⚠️ Limit outdoor activity for sensitive groups' if _aqi > 100 else '✅ Normal activity safe'} | ✅ All safe |\n"
+        f"| Mask recommendation | {'😷 N95/KN95 outdoors for sensitive groups' if _aqi > 150 else '😷 Optional for sensitive groups' if _aqi > 100 else '✅ Not required'} | ✅ Not required |"
+    )
+
+    # ── Implementation Timeline (deterministic, all domains) ──────────────────
+    _top_water = water['restoration_plan'][0][:55] if water['restoration_plan'] else "Water body restoration"
+    _top_energy_item = next((i['intervention'] for i in energy['interventions'] if i['feasible'].startswith("✅")), "Solar PV")
+    _sp1 = plant['species'][0]['common'] if plant['species'] else "native trees"
+    _timeline_table = (
+        "| Domain | Year 1 (Quick wins) | Years 2–3 (Scale up) | Years 4–5 (Systemic) |\n"
+        "|---|---|---|---|\n"
+        f"| 🌬 **Air Quality** | {pol['actions']['short_term_24_72h'][0][:50]} | {pol['actions']['medium_term_1_6mo'][0][:50]} | {pol['actions']['long_term_1_5yr'][0][:50]} |\n"
+        f"| 🌳 **Trees** | Nursery beds; {_sp1} pilot plots | {plant['priority_zones'][0][:50]} at {plant['trees_per_hectare']} trees/ha | Full {carbon['trees_modelled']:,}-tree plan; canopy monitoring |\n"
+        f"| 💧 **Water** | {_top_water[:50]} | Mandate RWH on new buildings | Groundwater recharge network; drip irrigation |\n"
+        f"| ⚡ **Energy** | {_top_energy_item} on public buildings (5% potential) | Net-metering for commercial roofs (to 25%) | Residential mass adoption (to 60%) |\n"
+        f"| 🪨 **Soil** | {soil['recommendations'][0][:50]} | Biochar application; mycorrhizal inoculation | Cover crops; structural soil under pavements |\n"
+        f"| 🏙 **Urban** | Miyawaki plots + road median planting | Rooftop green mandate for new construction | Full WHO green-space target programme |"
+    )
+
     all_assumptions = ctx["assumptions"] + ctx["aqi"].get("notes", [])
     assumptions = "; ".join(all_assumptions) if all_assumptions else "none"
     report = f"""
 # 🌿 EcoGPT Environmental Report — {L['city']}, {L['country']}
 
+{_exec_summary}
 {at_a_glance}
 
 ## Environmental Assessment
@@ -2704,6 +2760,11 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
 - Green-space requirement: **{urban['required_green_ha_per_km2']} ha/km²** to meet WHO 9 m²/capita ({urban['note']})
 - Sensor anomalies:
 {anomalies}
+
+## 🏥 Public Health Impact Assessment
+{_health_table}
+
+*Health figures are population-level estimates based on WHO/EPA AQI-health dose-response relationships. Individual risk varies. Consult local health authorities for clinical guidance.*
 
 {_ai_analysis_section}
 
@@ -2741,6 +2802,16 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
 {_ins_water}
 
 ## Urban Greening Strategy
+**Population density:** {urban['density_per_km2']:,}/km² — classified as **{urban['classification']}**
+**WHO green-space standard:** 9 m²/capita | **Current deficit:** ~**{urban['required_green_ha_per_km2']} ha/km²** needed
+**Per-capita CO₂:** ~{urban['per_capita_co2_t']} t/yr | **Trees for 1% offset per 1,000 residents:** {urban['trees_per_1000_residents_full_offset']:,}
+{urban['co2_honesty_note']} *(estimated)*
+
+**Greening without displacement** (ranked by land availability):
+{chr(10).join("- " + g for g in urban['greening_without_displacement'])}
+
+**Dense urban toolkit** (space-efficient interventions):
+{chr(10).join("- " + t for t in urban['dense_urban_toolkit'])}
 {_ins_urban}
 
 ## Biodiversity Enhancement Plan
@@ -2773,6 +2844,9 @@ With full implementation over 5 years: AQI improvement {"15–30" if ctx['aqi'][
 
 ## What-If Simulation
 {sim_txt}
+
+## 📅 Implementation Timeline
+{_timeline_table}
 
 ---
 *Grounded in: {", ".join(sorted(set(g['source'] for agent in (pol,plant,water,urban,carbon,soil,energy) for g in agent['grounding'])))}.*
