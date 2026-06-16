@@ -1135,10 +1135,27 @@ import time
 import requests as _rq
 
 # ── Backend configuration ────────────────────────────────────────────────────
-# AMD vLLM: OpenAI-compatible endpoint served by vLLM on AMD Instinct hardware
-AMD_VLLM_URL   = os.environ.get("AMD_VLLM_URL",   "")          # e.g. http://localhost:8000
-AMD_VLLM_MODEL = os.environ.get("AMD_VLLM_MODEL", "")          # model name passed to vLLM
-AMD_VLLM_KEY   = os.environ.get("AMD_VLLM_KEY",   "")          # bearer token (optional)
+#
+# AMD vLLM — matches the AMD Instinct / MI300X workshop configuration.
+#
+# To start the vLLM server on an AMD GPU (run in a terminal):
+#
+#   VLLM_USE_TRITON_FLASH_ATTN=0 \
+#   vllm serve Qwen/Qwen3-30B-A3B \
+#       --served-model-name Qwen3-30B-A3B \
+#       --api-key abc-123 \
+#       --port 8000 \
+#       --enable-auto-tool-choice \
+#       --tool-call-parser hermes \
+#       --trust-remote-code
+#
+# Monitor GPU utilisation while serving:
+#   watch rocm-smi
+#
+# Defaults match the AMD workshop setup; override with env vars if needed:
+AMD_VLLM_URL   = os.environ.get("AMD_VLLM_URL",   "http://localhost:8000")
+AMD_VLLM_MODEL = os.environ.get("AMD_VLLM_MODEL", "Qwen3-30B-A3B")
+AMD_VLLM_KEY   = os.environ.get("AMD_VLLM_KEY",   "abc-123")   # AMD workshop default key
 
 # Ollama: local model server (works with AMD ROCm via ollama pull + ollama serve)
 OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -1147,6 +1164,59 @@ OLLAMA_MODELS = ["mistral:7b-instruct", "mistral", "llama3.1:8b", "llama3.1", "l
 # HuggingFace Inference API: cloud fallback
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_MODEL  = os.environ.get("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+
+# ── AMD vLLM setup helper ─────────────────────────────────────────────────────
+
+def setup_amd_vllm(model="Qwen/Qwen3-30B-A3B", served_name="Qwen3-30B-A3B",
+                   api_key="abc-123", port=8000):
+    """Print the exact terminal command to launch vLLM on an AMD Instinct GPU,
+    then probe the endpoint and reinitialise EcoGPT's LLM backend.
+
+    Matches the AMD MI300X workshop configuration (Qwen3-30B-A3B, port 8000).
+
+    Args:
+        model       : HuggingFace model ID to download/serve
+        served_name : Alias shown in /v1/models (used in API calls)
+        api_key     : Bearer token for the local endpoint (any string works)
+        port        : TCP port the vLLM server listens on
+
+    Usage in notebook:
+        setup_amd_vllm()          # defaults match AMD workshop
+        setup_amd_vllm("Qwen/Qwen3-8B", served_name="Qwen3-8B")  # smaller model
+    """
+    cmd = (f"VLLM_USE_TRITON_FLASH_ATTN=0 \\\n"
+           f"vllm serve {model} \\\n"
+           f"    --served-model-name {served_name} \\\n"
+           f"    --api-key {api_key} \\\n"
+           f"    --port {port} \\\n"
+           f"    --enable-auto-tool-choice \\\n"
+           f"    --tool-call-parser hermes \\\n"
+           f"    --trust-remote-code")
+    print("── AMD vLLM launch command ──────────────────────────────")
+    print(cmd)
+    print("\nMonitor GPU (AMD ROCm):")
+    print("  watch rocm-smi")
+    print("\nOnce the server prints 'Application startup complete', run:")
+    print("  global LLM; LLM = LLMBackend()   # to reinitialise EcoGPT's backend")
+    print("─────────────────────────────────────────────────────────")
+
+    # Also set env vars so LLMBackend() picks them up on re-init
+    os.environ["AMD_VLLM_URL"]   = f"http://localhost:{port}"
+    os.environ["AMD_VLLM_MODEL"] = served_name
+    os.environ["AMD_VLLM_KEY"]   = api_key
+
+    # Probe (non-fatal — the server may not be started yet)
+    try:
+        r = _rq.get(f"http://localhost:{port}/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"}, timeout=3)
+        if r.status_code == 200:
+            models = [m["id"] for m in r.json().get("data", [])]
+            print(f"✅ vLLM server already running — models: {models}")
+        else:
+            print(f"⚠️  vLLM server responded with HTTP {r.status_code} (may still be loading)")
+    except Exception:
+        print("ℹ️  vLLM server not yet reachable — start it with the command above first")
+
 
 # ── LLM call log ─────────────────────────────────────────────────────────────
 # Each entry added by LLMBackend.generate():
