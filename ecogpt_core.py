@@ -2014,8 +2014,27 @@ print("Agents defined ✓  (data, rag, pollution, plantation, water, urban, carb
 # ════════ 09_orchestrator.py ════════
 # ============================================================
 # Cell 9: Synthesis Agent + Orchestrator
-#   Deterministic pipeline always runs; LLM (Ollama/HF) polishes
-#   the final report and answers free-form follow-ups with RAG.
+#
+# Entry points:
+#   ask_ecogpt(query, user_type, polish, survey_radius_km)
+#       → full pipeline: location → 8 agents → synthesis → optional LLM polish
+#       → returns Markdown report string
+#       → caches last result in ask_ecogpt.last{} for the dashboard / Streamlit
+#
+#   ask_followup(question)
+#       → hybrid RAG + LLM (or deterministic fallback) for follow-up questions
+#       → must be called after ask_ecogpt() to have context
+#
+#   ask_ecogpt_adk(query)  [async]
+#       → same pipeline routed through Google ADK SequentialAgent when installed
+#
+# Design principles:
+#   - Every agent runs deterministically first (scientific core always produces output)
+#   - LLM (AMD vLLM / Ollama / HF) only polishes text — it never originates figures
+#   - user_type controls audience-specific section appended to report
+#     ("government" → policy brief + KPIs, "ngo" → community actions,
+#      "researcher" → full data provenance, "default" → no extra section)
+#   - All assumptions and estimates are passed through to the final report
 # ============================================================
 
 _LOC_NOISE = {"location","improve","environment","focus","water","tree","trees","pollution",
@@ -2141,6 +2160,32 @@ def _user_type_note(user_type: str, ctx, pol, plant, water, energy, carbon, urba
 
 
 def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type="default"):
+    """Assemble the final Markdown report from all 8 agent outputs.
+
+    Deterministic — no LLM call here. The LLM polish step is done in ask_ecogpt()
+    after this function returns, so the raw report is always available as fallback.
+
+    Sections produced:
+      At a Glance table (letter grades) → Environmental Assessment → Key Risks →
+      Recommended Species table → Plantation Plan → Pollution Actions →
+      Soil → Water → Biodiversity → Carbon table → Energy plan →
+      What-If Simulation → Priority Action Items (location-specific, max 10) →
+      Audience-specific section (_user_type_note)
+
+    Args:
+        ctx    : Data ingestion output (AQI, temp, humidity, location, assumptions …)
+        pol    : Pollution agent output (source apportionment, actions, bio-filter species)
+        plant  : Plantation agent output (species list, density, zones, canopy layers)
+        water  : Water agent output (stress level, restoration plan, RWH figures)
+        urban  : Urban agent output (green-space deficit, density class, toolkit)
+        carbon : Carbon agent output (sequestration table, cars-equivalent, confidence)
+        soil   : Soil agent output (recommendations list)
+        energy : Energy agent output (solar plan, interventions, terrain)
+        user_type: "government" | "ngo" | "researcher" | "default"
+
+    Returns:
+        Markdown string (stripped, ready for display or LLM refinement).
+    """
     L = ctx["location"]
     sp_rows = "\n".join(
         f"| {s['scientific']} | {s['common']} | {s['role'][:45]} | {s['co2_kg_yr']} | {s['water']} | {s['native_to']} |"
