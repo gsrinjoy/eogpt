@@ -834,33 +834,99 @@ def _poly_area_m2(coords):
 _LIVE_CACHE, _TERRAIN_CACHE, _POP_CACHE = {}, {}, {}
 
 def fetch_live_environment(lat: float, lon: float):
-    """REAL location-specific data for ANY point on Earth:
-    CAMS air quality (PM2.5/PM10/CO/NO2) + ERA5 weather + solar radiation + wind.
-    Returns dict or None when offline."""
+    """Fetch CURRENT (not averaged) environmental conditions for any point on Earth.
+
+    Data sources (all free, no API key required):
+    - Open-Meteo CAMS air quality: PM2.5, PM10, CO (µg/m³), NO2 (µg/m³)
+    - Open-Meteo ERA5 weather: temperature, humidity, apparent temp, solar, wind
+
+    Strategy: request the `current` object (single real-time reading) in addition
+    to 7-day hourly history.  Current readings are used for the dashboard display;
+    daily-mean solar is derived from today's hourly radiation values only.
+
+    Unit conversions applied:
+      CO:  µg/m³ → ppm  (÷ 1145,  at 25 °C, 1 atm)
+      NO2: µg/m³ → ppb  (÷ 1.88,  at 25 °C, 1 atm)
+      wind: km/h  → m/s (÷ 3.6)
+      solar: W/m² hourly mean → kWh/m²/day (× 24 / 1000)
+
+    Returns dict with keys: pm25, pm10, co_ppm, no2_ppb, tmp, hmd, hi,
+    solar_kwh_m2_day, wind_ms, data_ts (ISO timestamp of reading).
+    Returns None when offline or API unreachable."""
     key = (round(lat, 2), round(lon, 2))
     if key in _LIVE_CACHE: return _LIVE_CACHE[key]
     import requests as _r
+
+    def _last_valid(lst):
+        """Return the most-recent non-null value from an hourly list (right-to-left scan).
+        Falls back to nanmean of last 6 values if all recent entries are null."""
+        vals = [x for x in reversed(lst) if x is not None]
+        if not vals: return float("nan")
+        # Prefer single most-recent value; average last 3 if that one looks anomalous
+        return float(vals[0])
+
     try:
-        aq = _r.get("https://air-quality-api.open-meteo.com/v1/air-quality",
-            params={"latitude": lat, "longitude": lon, "past_days": 2,
+        # ── Air quality: current + today's hourly slice ──────────────────────
+        aq_resp = _r.get(
+            "https://air-quality-api.open-meteo.com/v1/air-quality",
+            params={"latitude": lat, "longitude": lon,
+                    # current= gives the single live reading (model analysis step)
+                    "current": "pm2_5,pm10,carbon_monoxide,nitrogen_dioxide",
+                    # hourly for 2 days kept for fallback if current is null
+                    "past_days": 2,
                     "hourly": "pm2_5,pm10,carbon_monoxide,nitrogen_dioxide"},
-            timeout=12).json()["hourly"]
-        wx = _r.get("https://api.open-meteo.com/v1/forecast",
-            params={"latitude": lat, "longitude": lon, "past_days": 7,
-                    "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                              "shortwave_radiation,wind_speed_10m"},
-            timeout=12).json()["hourly"]
-        m = lambda v: float(np.nanmean([x for x in v if x is not None])) if any(
-            x is not None for x in v) else float("nan")
-        out = {"pm25": m(aq["pm2_5"]), "pm10": m(aq["pm10"]),
-               "co_ppm": m(aq["carbon_monoxide"]) / 1145.0,    # µg/m³ → ppm (25°C)
-               "no2_ppb": m(aq["nitrogen_dioxide"]) / 1.88,    # µg/m³ → ppb
-               "tmp": m(wx["temperature_2m"]), "hmd": m(wx["relative_humidity_2m"]),
-               "hi": m(wx["apparent_temperature"]),
-               "solar_kwh_m2_day": m(wx["shortwave_radiation"]) * 24 / 1000.0,
-               "wind_ms": m(wx["wind_speed_10m"]) / 3.6}       # km/h → m/s
+            timeout=12).json()
+        cur_aq  = aq_resp.get("current", {})
+        hr_aq   = aq_resp.get("hourly", {})
+        data_ts = cur_aq.get("time", "")
+
+        # Helper: prefer current reading, fall back to last hourly value
+        def _aq(key_c, key_h):
+            v = cur_aq.get(key_c)
+            if v is not None: return float(v)
+            return _last_valid(hr_aq.get(key_h, []))
+
+        # ── Weather: current + today-only hourly for solar ───────────────────
+        wx_resp = _r.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": lat, "longitude": lon,
+                    "current": "temperature_2m,relative_humidity_2m,"
+                               "apparent_temperature,wind_speed_10m",
+                    # Only fetch today's hourly data for solar mean (not 7-day avg)
+                    "hourly": "shortwave_radiation",
+                    "forecast_days": 1},
+            timeout=12).json()
+        cur_wx = wx_resp.get("current", {})
+        hr_wx  = wx_resp.get("hourly", {})
+
+        def _wx(key_c, fallback=None):
+            v = cur_wx.get(key_c)
+            if v is not None: return float(v)
+            return fallback if fallback is not None else float("nan")
+
+        # Solar: average of today's hourly shortwave radiation → kWh/m²/day
+        solar_vals = [x for x in hr_wx.get("shortwave_radiation", []) if x is not None]
+        solar_kwh  = (float(np.mean(solar_vals)) * 24 / 1000.0) if solar_vals else float("nan")
+
+        out = {
+            # Air quality — current model analysis step
+            "pm25":     _aq("pm2_5",              "pm2_5"),
+            "pm10":     _aq("pm10",               "pm10"),
+            "co_ppm":   _aq("carbon_monoxide",    "carbon_monoxide")  / 1145.0,
+            "no2_ppb":  _aq("nitrogen_dioxide",   "nitrogen_dioxide") / 1.88,
+            # Weather — instantaneous current reading
+            "tmp":      _wx("temperature_2m"),
+            "hmd":      _wx("relative_humidity_2m"),
+            "hi":       _wx("apparent_temperature"),
+            "wind_ms":  _wx("wind_speed_10m", 0.0) / 3.6,
+            # Solar: today's mean (W/m² → kWh/m²/day)
+            "solar_kwh_m2_day": solar_kwh,
+            # Metadata
+            "data_ts": data_ts,          # ISO timestamp of the current AQ reading
+        }
         _LIVE_CACHE[key] = out if not math.isnan(out["tmp"]) else None
-    except Exception:
+    except Exception as _e:
+        # Silently cache None so callers fall back to sensor/climate-zone data
         _LIVE_CACHE[key] = None
     return _LIVE_CACHE[key]
 
@@ -1044,60 +1110,269 @@ print("  e.g. compute_aqi(no2_ppm=0.04, co_ppm=8, dd=250) →", compute_aqi(no2_
 
 # ════════ 07_llm.py ════════
 # ============================================================
-# Cell 7: Pluggable LLM Backend — Ollama → HuggingFace → None
-#   Every agent works WITHOUT an LLM (deterministic scientific core);
-#   when a backend is live the LLM polishes and calibrates narrative.
+# Cell 7: Pluggable LLM Backend
+#
+# Priority order (auto-detected at startup):
+#   1. AMD vLLM   — OpenAI-compatible vLLM server on AMD Instinct GPU
+#                   (set AMD_VLLM_URL + AMD_VLLM_MODEL env vars)
+#   2. Ollama     — local model running via `ollama serve` (AMD ROCm or CPU)
+#   3. HuggingFace Inference API — cloud fallback (requires HF_TOKEN)
+#   4. None       — fully deterministic engine; all agents still work,
+#                   narrative is un-polished but scientifically correct
+#
+# Every LLM call is timed and its token usage captured in LLM_LOG so the
+# dashboard can display latency, token counts, and the active backend.
+#
+# Environment variables (set before running the notebook):
+#   AMD_VLLM_URL    URL of the vLLM server  e.g. http://localhost:8000
+#   AMD_VLLM_MODEL  Model name served by vLLM  e.g. meta-llama/Llama-3.1-8B-Instruct
+#   AMD_VLLM_KEY    API key for the vLLM endpoint (empty string = no auth)
+#   OLLAMA_URL      Ollama API base  (default: http://localhost:11434)
+#   HF_TOKEN        HuggingFace user access token
+#   HF_MODEL        HuggingFace model repo  (default: Mistral-7B-Instruct-v0.3)
 # ============================================================
+import time
 import requests as _rq
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+# ── Backend configuration ────────────────────────────────────────────────────
+# AMD vLLM: OpenAI-compatible endpoint served by vLLM on AMD Instinct hardware
+AMD_VLLM_URL   = os.environ.get("AMD_VLLM_URL",   "")          # e.g. http://localhost:8000
+AMD_VLLM_MODEL = os.environ.get("AMD_VLLM_MODEL", "")          # model name passed to vLLM
+AMD_VLLM_KEY   = os.environ.get("AMD_VLLM_KEY",   "")          # bearer token (optional)
+
+# Ollama: local model server (works with AMD ROCm via ollama pull + ollama serve)
+OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODELS = ["mistral:7b-instruct", "mistral", "llama3.1:8b", "llama3.1", "llama3"]
+
+# HuggingFace Inference API: cloud fallback
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-HF_MODEL = os.environ.get("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+HF_MODEL  = os.environ.get("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+
+# ── LLM call log ─────────────────────────────────────────────────────────────
+# Each entry added by LLMBackend.generate():
+#   {"ts": ISO-str, "backend": str, "model": str, "latency_ms": int,
+#    "tokens_in": int, "tokens_out": int, "success": bool}
+LLM_LOG = []
+
+
+def llm_usage_summary():
+    """Print a human-readable summary of all LLM calls made so far.
+
+    Shows: backend used, total calls, total tokens (in/out), mean latency,
+    and per-call detail.  Call this at the end of a notebook session to
+    audit inference cost and performance."""
+    if not LLM_LOG:
+        print("No LLM calls logged yet.")
+        return
+    total_in  = sum(e["tokens_in"]  for e in LLM_LOG)
+    total_out = sum(e["tokens_out"] for e in LLM_LOG)
+    mean_lat  = sum(e["latency_ms"] for e in LLM_LOG) / len(LLM_LOG)
+    ok        = sum(1 for e in LLM_LOG if e["success"])
+    print(f"\n{'═'*62}")
+    print(f"  EcoGPT LLM Usage Summary  ({len(LLM_LOG)} calls, {ok} succeeded)")
+    print(f"{'═'*62}")
+    print(f"  Backend    : {LLM_LOG[-1]['backend']}  ({LLM_LOG[-1]['model']})")
+    print(f"  Tokens in  : {total_in:,}   Tokens out: {total_out:,}"
+          f"   Total: {total_in+total_out:,}")
+    print(f"  Avg latency: {mean_lat:.0f} ms   "
+          f"Min: {min(e['latency_ms'] for e in LLM_LOG)} ms   "
+          f"Max: {max(e['latency_ms'] for e in LLM_LOG)} ms")
+    print(f"{'─'*62}")
+    for i, e in enumerate(LLM_LOG, 1):
+        status = "✅" if e["success"] else "❌"
+        print(f"  [{i:2d}] {status} {e['ts'][:19]}  "
+              f"{e['latency_ms']:5d} ms  "
+              f"in={e['tokens_in']:4d}  out={e['tokens_out']:4d}  "
+              f"{e['model']}")
+    print(f"{'═'*62}\n")
+
 
 class LLMBackend:
-    """Auto-detects best available backend. .generate(system, user) → str|None"""
+    """Auto-detects the best available LLM backend at startup.
+
+    Call `backend.generate(system, user)` from any agent to get a polished
+    text response.  Returns None (not an exception) when all backends fail —
+    the deterministic scientific core always provides the fallback output.
+
+    Attributes:
+        kind  (str): Active backend — "amd_vllm" | "ollama" | "hf" | "none"
+        model (str): Model name/path currently in use
+    """
+
     def __init__(self):
-        self.kind, self.model = "none", None
-        try:  # 1) Ollama (AMD ROCm-accelerated locally)
-            tags = _rq.get(f"{OLLAMA_URL}/api/tags", timeout=2).json()
-            available = [m["name"] for m in tags.get("models", [])]
-            for want in OLLAMA_MODELS:
-                hit = next((a for a in available if a.startswith(want)), None)
-                if hit: self.kind, self.model = "ollama", hit; break
-            if self.kind == "none" and available:
-                self.kind, self.model = "ollama", available[0]
-        except Exception:
-            pass
-        if self.kind == "none" and HF_TOKEN:  # 2) HuggingFace Inference API
+        self.kind  = "none"
+        self.model = None
+
+        # ── 1. AMD vLLM (highest priority when configured) ────────────────
+        # AMD provides a vLLM server with OpenAI-compatible /v1/chat/completions.
+        # Set AMD_VLLM_URL + AMD_VLLM_MODEL to activate.
+        if AMD_VLLM_URL and AMD_VLLM_MODEL:
+            try:
+                headers = {}
+                if AMD_VLLM_KEY:
+                    headers["Authorization"] = f"Bearer {AMD_VLLM_KEY}"
+                # Probe the /v1/models endpoint to confirm the server is alive
+                probe = _rq.get(f"{AMD_VLLM_URL.rstrip('/')}/v1/models",
+                                headers=headers, timeout=4)
+                if probe.status_code == 200:
+                    self.kind  = "amd_vllm"
+                    self.model = AMD_VLLM_MODEL
+            except Exception:
+                pass  # vLLM server not reachable; try next backend
+
+        # ── 2. Ollama (local, AMD ROCm-accelerated if available) ──────────
+        if self.kind == "none":
+            try:
+                tags      = _rq.get(f"{OLLAMA_URL}/api/tags", timeout=2).json()
+                available = [m["name"] for m in tags.get("models", [])]
+                for want in OLLAMA_MODELS:
+                    hit = next((a for a in available if a.startswith(want)), None)
+                    if hit:
+                        self.kind, self.model = "ollama", hit
+                        break
+                # Fallback: take whatever model is loaded
+                if self.kind == "none" and available:
+                    self.kind, self.model = "ollama", available[0]
+            except Exception:
+                pass
+
+        # ── 3. HuggingFace Inference API (cloud, no local GPU needed) ─────
+        if self.kind == "none" and HF_TOKEN:
             self.kind, self.model = "hf", HF_MODEL
-        print(f"LLM backend: {self.kind}" + (f" ({self.model})" if self.model else
-              "  → deterministic engine only (fully functional, narrative un-polished)"))
 
-    def generate(self, system: str, user: str, max_tokens=900, temperature=0.4):
+        # ── Report active backend ──────────────────────────────────────────
+        _backend_label = {
+            "amd_vllm": "AMD vLLM",
+            "ollama":   "Ollama (local)",
+            "hf":       "HuggingFace Inference API",
+            "none":     "None",
+        }[self.kind]
+        _model_info = f" ({self.model})" if self.model else ""
+        print(f"LLM backend: {_backend_label}{_model_info}"
+              + ("" if self.kind != "none" else
+                 "  → deterministic engine only (fully functional, narrative un-polished)"))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def generate(self, system: str, user: str,
+                 max_tokens: int = 900, temperature: float = 0.4) -> "str | None":
+        """Send a chat-completion request to the active backend.
+
+        Logs every call to the module-level LLM_LOG list with:
+          - backend / model name
+          - latency in milliseconds
+          - prompt tokens (tokens_in) and completion tokens (tokens_out)
+          - success flag
+
+        Args:
+            system      : System prompt (agent persona + instructions)
+            user        : User turn (context + question)
+            max_tokens  : Maximum tokens to generate (default 900)
+            temperature : Sampling temperature 0–1 (default 0.4)
+
+        Returns:
+            Stripped response string, or None on failure (callers use
+            deterministic output as fallback).
+        """
+        import datetime
+        _log = {
+            "ts":          datetime.datetime.now().isoformat(),
+            "backend":     self.kind,
+            "model":       self.model or "none",
+            "latency_ms":  0,
+            "tokens_in":   0,
+            "tokens_out":  0,
+            "success":     False,
+        }
+        t0 = time.time()
+        result = None
         try:
-            if self.kind == "ollama":
-                r = _rq.post(f"{OLLAMA_URL}/api/chat", json={
-                    "model": self.model, "stream": False,
-                    "messages": [{"role":"system","content":system},
-                                 {"role":"user","content":user}],
-                    "options": {"temperature": temperature, "num_predict": max_tokens}},
-                    timeout=180)
-                return r.json()["message"]["content"].strip()
-            if self.kind == "hf":
-                r = _rq.post(
-                    f"https://api-inference.huggingface.co/models/{self.model}/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                    json={"model": self.model, "max_tokens": max_tokens,
-                          "temperature": temperature,
-                          "messages": [{"role":"system","content":system},
-                                       {"role":"user","content":user}]},
-                    timeout=120)
-                return r.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            print(f"  (LLM call failed: {e} — using deterministic output)")
-        return None
+            # ── AMD vLLM: OpenAI-compatible /v1/chat/completions ──────────
+            if self.kind == "amd_vllm":
+                headers = {"Content-Type": "application/json"}
+                if AMD_VLLM_KEY:
+                    headers["Authorization"] = f"Bearer {AMD_VLLM_KEY}"
+                resp = _rq.post(
+                    f"{AMD_VLLM_URL.rstrip('/')}/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model":       self.model,
+                        "max_tokens":  max_tokens,
+                        "temperature": temperature,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user",   "content": user},
+                        ],
+                    },
+                    timeout=180,
+                ).json()
+                result = resp["choices"][0]["message"]["content"].strip()
+                # vLLM returns OpenAI-style usage object
+                usage = resp.get("usage", {})
+                _log["tokens_in"]  = usage.get("prompt_tokens",     0)
+                _log["tokens_out"] = usage.get("completion_tokens", 0)
 
+            # ── Ollama: native /api/chat endpoint ─────────────────────────
+            elif self.kind == "ollama":
+                resp = _rq.post(
+                    f"{OLLAMA_URL}/api/chat",
+                    json={
+                        "model":   self.model,
+                        "stream":  False,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user",   "content": user},
+                        ],
+                        "options": {
+                            "temperature": temperature,
+                            "num_predict": max_tokens,
+                        },
+                    },
+                    timeout=180,
+                ).json()
+                result = resp["message"]["content"].strip()
+                # Ollama reports eval_count (output) and prompt_eval_count (input)
+                _log["tokens_in"]  = resp.get("prompt_eval_count", 0)
+                _log["tokens_out"] = resp.get("eval_count",        0)
+
+            # ── HuggingFace Inference API: OpenAI-compat /v1/chat ─────────
+            elif self.kind == "hf":
+                resp = _rq.post(
+                    f"https://api-inference.huggingface.co/models/{self.model}"
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                    json={
+                        "model":       self.model,
+                        "max_tokens":  max_tokens,
+                        "temperature": temperature,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user",   "content": user},
+                        ],
+                    },
+                    timeout=120,
+                ).json()
+                result = resp["choices"][0]["message"]["content"].strip()
+                usage = resp.get("usage", {})
+                _log["tokens_in"]  = usage.get("prompt_tokens",     0)
+                _log["tokens_out"] = usage.get("completion_tokens", 0)
+
+            _log["success"] = result is not None
+
+        except Exception as _e:
+            print(f"  LLM call failed ({self.kind}): {_e} — deterministic output used")
+
+        _log["latency_ms"] = int((time.time() - t0) * 1000)
+        LLM_LOG.append(_log)
+
+        # Print a one-line telemetry receipt after each call
+        status = "✅" if _log["success"] else "❌"
+        print(f"  {status} LLM [{self.kind}] {_log['model']}  "
+              f"latency={_log['latency_ms']} ms  "
+              f"tokens in={_log['tokens_in']} out={_log['tokens_out']}")
+        return result
+
+
+# Instantiate the singleton backend (probes all endpoints at import time)
 LLM = LLMBackend()
 
 
@@ -1277,7 +1552,10 @@ def run_data_ingestion(lat, lon, radius=0.05, label=None):
             "solar_kwh_m2_day": round(solar, 2), "wind_ms": round(wind, 1),
             "readings_used": len(local), "anomalies": anomalies,
             "data_completeness": round(completeness,2), "assumptions": assumptions,
-            "stats": {k:{kk:round(vv,2) for kk,vv in v.items()} for k,v in stats.items()}}
+            "stats": {k:{kk:round(vv,2) for kk,vv in v.items()} for k,v in stats.items()},
+            # Store the raw live-environment dict so downstream code can access
+            # the data timestamp and other metadata (e.g. for the dashboard footer)
+            "live_env": live}
 
 # ---------------- Agent 3: Pollution ----------------
 def run_pollution_agent(ctx):

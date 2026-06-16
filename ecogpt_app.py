@@ -40,6 +40,22 @@ with st.sidebar:
                " — deterministic engine"))
     st.caption(f"Retrieval: **{' + '.join(core.retriever.mode)}**")
     st.caption("Data: IoT sensors → live Open-Meteo CAMS/ERA5 → calibrated fallbacks")
+    # ── LLM telemetry panel ───────────────────────────────────
+    if core.LLM_LOG:
+        with st.expander(f"🤖 LLM telemetry ({len(core.LLM_LOG)} calls)", expanded=False):
+            _tot_in  = sum(e["tokens_in"]  for e in core.LLM_LOG)
+            _tot_out = sum(e["tokens_out"] for e in core.LLM_LOG)
+            _avg_lat = int(sum(e["latency_ms"] for e in core.LLM_LOG) / len(core.LLM_LOG))
+            st.metric("Tokens in",  f"{_tot_in:,}")
+            st.metric("Tokens out", f"{_tot_out:,}")
+            st.metric("Avg latency", f"{_avg_lat} ms")
+            import pandas as _pd_st
+            st.dataframe(_pd_st.DataFrame(core.LLM_LOG)[
+                ["ts", "backend", "model", "latency_ms",
+                 "tokens_in", "tokens_out", "success"]
+            ].rename(columns={"latency_ms": "ms", "tokens_in": "↑tok",
+                               "tokens_out": "↓tok"}),
+                use_container_width=True, hide_index=True)
 
 if run and query.strip():
     loc = core.parse_location(query.strip())
@@ -79,7 +95,20 @@ _audience_badge = {"government": "🏛 Government/Policy", "ngo": "🤝 NGO/Comm
                    "researcher": "🔬 Researcher", "default": "🌍 General"
                    }.get(st.session_state.get("audience_used", "default"), "🌍 General")
 st.title(f"🌿 {ctx['location']['city']}, {ctx['location']['country']}")
-st.caption(f"📡 {ctx['data_source']}  ·  {ctx['location']['climate_name']} ({ctx['location']['climate_zone']})  ·  {_audience_badge} report")
+
+# Build caption: data source + live timestamp + LLM backend info
+_live_ts = (ctx.get("live_env") or {}).get("data_ts", "")
+_ts_part  = f"  ·  📅 {_live_ts[:16]}" if _live_ts else ""
+_llm_part = ""
+if core.LLM_LOG:
+    _le = core.LLM_LOG[-1]
+    _llm_part = (f"  ·  🤖 {core.LLM.kind}/{_le['model'].split('/')[-1]}"
+                 f"  {_le['latency_ms']} ms  ↑{_le['tokens_in']} ↓{_le['tokens_out']} tok")
+elif core.LLM.kind != "none":
+    _llm_part = f"  ·  🤖 {core.LLM.kind} ({core.LLM.model})"
+st.caption(f"📡 {ctx['data_source']}{_ts_part}"
+           f"  ·  {ctx['location']['climate_name']} ({ctx['location']['climate_zone']})"
+           f"  ·  {_audience_badge} report{_llm_part}")
 
 m = st.columns(6)
 aqi = ctx["aqi"]["score"]
