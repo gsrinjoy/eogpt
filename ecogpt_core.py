@@ -1532,6 +1532,18 @@ class LLMBackend:
             print(f"  LLM call failed ({self.kind}): {_e} — deterministic output used")
 
         _log["latency_ms"] = int((time.time() - t0) * 1000)
+
+        # Strip Qwen3 / DeepSeek chain-of-thought blocks (<think>…</think>).
+        # These reasoning tokens are internal scratch space — they consume token
+        # budget and must not appear in the final report or agent insights.
+        if result:
+            import re as _re
+            result = _re.sub(r"<think>.*?</think>", "", result,
+                             flags=_re.DOTALL | _re.IGNORECASE).strip()
+            # Also strip any lingering think-open tags without a close (truncated response)
+            result = _re.sub(r"<think>.*", "", result,
+                             flags=_re.DOTALL | _re.IGNORECASE).strip()
+
         LLM_LOG.append(_log)
 
         # Print a one-line telemetry receipt after each call
@@ -2710,13 +2722,14 @@ def ask_ecogpt(query: str, user_type: str = "default", polish: bool = True,
     soil   = run_soil_recommendations(ctx)
     energy = run_energy_agent(ctx)
     report = run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type)
-    if polish and LLM.kind != "none":
-        polished = LLM.generate(
-            SYSTEM_PROMPTS["synthesis"] + f"\nUser type: {user_type}. Keep ALL numbers, species names and "
-            "tables EXACTLY as given. Improve flow and tone only; do not add facts.",
-            f"User query: {query}\n\nDraft report to refine:\n{report}", max_tokens=1800)
-        if polished and len(polished) > 400:
-            report = polished
+    # NOTE: The full deterministic report is preserved as-is. LLM intelligence is
+    # contributed in two places already:
+    #   1. Per-agent llm_insight fields (08_agents.py) — focused analytical insights
+    #   2. _ai_analysis_section inside run_synthesis() — cross-domain reasoning block
+    # A "polish" pass that rewrites the full report would replace 4000+ words of
+    # structured deterministic output with whatever the LLM generates (often much
+    # shorter, and on thinking-mode models like Qwen3 the <think> tokens consume most
+    # of the token budget).  So we keep polish=False by default and skip this step.
     ask_ecogpt.last = {"ctx":ctx,"pol":pol,"plant":plant,"water":water,
                        "urban":urban,"carbon":carbon,"soil":soil,"energy":energy,
                        "spaces": spaces}   # cached here — Streamlit uses this, no duplicate OSM call
