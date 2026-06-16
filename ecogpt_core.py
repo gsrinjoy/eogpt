@@ -1614,13 +1614,13 @@ with 2-3 scenarios. Calibrate tone to user type. Never fabricate species or figu
 # names, or computed values — those come from the scientific core.  The LLM
 # only adds narrative interpretation, local context, and reasoning.
 
-def _agent_llm(agent_key: str, user_content: str, max_tokens: int = 220) -> str:
+def _agent_llm(agent_key: str, user_content: str, max_tokens: int = 1200) -> str:
     """Call the active LLM backend for a concise agent-level insight.
 
     Args:
         agent_key   : Key into SYSTEM_PROMPTS (e.g. "pollution", "plantation")
         user_content: Compact summary of the deterministic output + specific ask
-        max_tokens  : Cap output length — keep insights brief (default 220)
+        max_tokens  : Cap output length — default 1200 for rich expert analysis on local GPU
 
     Returns:
         LLM-generated insight string, or empty string if unavailable/failed.
@@ -1839,17 +1839,32 @@ def run_pollution_agent(ctx):
     # LLM validates source attribution and rates confidence in the AQI reading
     _pol_result["llm_insight"] = _agent_llm(
         "pollution",
-        (f"City: {ctx['location']['city']} | Climate: {ctx['location']['climate_name']} | "
+        (f"CITY: {ctx['location']['city']}, {ctx['location']['country']} | "
+         f"Climate: {ctx['location']['climate_name']} ({ctx['location']['climate_zone']})\n"
          f"AQI: {ctx['aqi']['score']} ({ctx['aqi']['category']}) | "
-         f"Dominant: {ctx['aqi']['dominant']} | Source signals: {sigs} | Classified as: '{source}'\n"
-         f"Heat index exceeds ambient by {round(ctx['heat_index_avg']-ctx['temperature_avg'],1)}°C "
-         f"({'heat island flagged' if heat_island else 'within normal range'}).\n"
-         f"Short-term actions: {'; '.join(short[:2])}\n\n"
-         "Task: (1) Rate your confidence (High/Medium/Low) in the source attribution above "
-         "given the signal pattern, and explain what one measurement would confirm or refute it. "
-         "(2) Name the ONE action from the list most likely to show measurable improvement "
-         "within 30 days for this specific source type. Be specific to this city and AQI level. "
-         "Under 80 words."),
+         f"Dominant pollutant: {ctx['aqi']['dominant']} | "
+         f"Source classified as: '{source}' | Signals: {sigs}\n"
+         f"Heat island delta: +{round(ctx['heat_index_avg']-ctx['temperature_avg'],1)}°C "
+         f"({'⚠️ heat island flagged' if heat_island else '✅ within normal range'})\n"
+         f"All short-term actions: {'; '.join(short)}\n"
+         f"All medium-term actions: {'; '.join(medium)}\n"
+         f"Long-term: {'; '.join(longt)}\n\n"
+         "Provide a comprehensive expert air quality analysis with the following sections:\n"
+         "1. SOURCE ATTRIBUTION ANALYSIS: Assess confidence in the source classification given "
+         "the pollutant signal mix. What does the combination of signals reveal about the "
+         "likely emission sources? What single measurement or monitoring action would "
+         "confirm or refute this attribution?\n"
+         "2. HEALTH IMPACT ASSESSMENT: At this specific AQI level and dominant pollutant, "
+         "what are the realistic short-term health risks for residents (especially vulnerable "
+         "groups)? What personal protective actions should the public take immediately?\n"
+         "3. INTERVENTION PRIORITY: Critically evaluate the action plan above. Which actions "
+         "will have the greatest measurable impact within 30 days, 6 months, and 5 years "
+         "respectively? Are there any gaps or improvements to the plan given this specific "
+         "source type?\n"
+         "4. HEAT ISLAND INTERACTION: How does the heat island effect interact with air quality "
+         "here? Does the temperature difference amplify or reduce pollutant concentrations?\n"
+         "Write in expert but accessible language. Use all the data provided above."),
+        max_tokens=1200,
     )
     return _pol_result
 
@@ -1907,16 +1922,29 @@ def run_plantation_agent(ctx):
     _top3_sp = [(s["scientific"], s["common"], s["role"][:50]) for s in species[:3]]
     _plant_result["llm_insight"] = _agent_llm(
         "plantation",
-        (f"City: {ctx['location']['city']} | Climate: {ctx['location']['climate_name']} "
-         f"({ctx['location']['climate_zone']}) | {'Arid zone' if arid else 'Non-arid'} | "
+        (f"CITY: {ctx['location']['city']} | Climate: {ctx['location']['climate_name']} "
+         f"({ctx['location']['climate_zone']}) | {'Arid zone — water-budget-first' if arid else 'Non-arid'} | "
          f"Density class: {dens_class} | Planting density: {trees_ha} trees/ha\n"
-         f"Top 3 recommended species: {_top3_sp}\n"
-         f"Priority zones: {priority_zones[:2]}\n\n"
-         "Task: (1) Flag any of these 3 species that may underperform or carry a risk "
-         "in this specific climate zone (drought stress, disease, soil pH mismatch). "
-         "(2) Suggest ONE concrete adjustment to the planting plan — different species, "
-         "spacing, or timing — that would improve long-term survival rate for this climate. "
-         "Under 80 words. No new species unless clearly superior for this zone."),
+         f"All recommended species (first 8): {[(s['scientific'], s['common'], s['role'][:60], s['co2_kg_yr']) for s in species[:8]]}\n"
+         f"Priority planting zones: {priority_zones}\n"
+         f"Spatial arrangement: {arrangement}\n"
+         f"Canopy layers: {canopy_layers}\n"
+         f"Invasive species to avoid: {INVASIVE_BLACKLIST}\n\n"
+         "Provide a comprehensive expert plantation analysis with the following sections:\n"
+         "1. SPECIES SUITABILITY REVIEW: For each of the top 5 recommended species, assess "
+         "their climate-zone suitability, known risks (drought stress, disease susceptibility, "
+         "soil requirements), and expected survival rate in this specific climate. Flag any "
+         "species that should be deprioritised and explain why.\n"
+         "2. ECOLOGICAL DESIGN RATIONALE: Why is this specific species mix, density, and "
+         "canopy layering optimal for this climate zone and density class? How does it maximise "
+         "both carbon sequestration and biodiversity value?\n"
+         "3. PLANTING STRATEGY & TIMING: What is the ideal planting season and establishment "
+         "protocol for this climate zone? What are the most critical first-year care requirements "
+         "to achieve high survival rates?\n"
+         "4. IMPROVEMENT SUGGESTIONS: Suggest 2-3 specific improvements to the plan that would "
+         "enhance long-term ecological performance for this specific location.\n"
+         "Use all the data provided above. Write for an expert audience."),
+        max_tokens=1200,
     )
     return _plant_result
 
@@ -1988,15 +2016,30 @@ def run_water_agent(ctx):
     # LLM prioritises the water plan given the specific rainfall and stress combination
     _water_result["llm_insight"] = _agent_llm(
         "water",
-        (f"City: {L['city']} | Climate: {ctx['location']['climate_name']} | "
-         f"Rainfall: {int(rain)} mm/yr ({rain_source}) | Stress: {stress} | "
-         f"Humidity: {ctx['humidity_avg']}% | Temp avg: {ctx['temperature_avg']}°C\n"
-         f"Restoration plan: {'; '.join(plan[:3])}\n"
-         f"RWH yield: {int(harvest_l):,} L/yr per 100 m² roof\n\n"
-         "Task: Given this rainfall level and stress category, rank the top 2 restoration "
-         "actions from the plan above by expected impact and explain WHY they are highest "
-         "priority for this specific rainfall regime. Note any seasonal timing consideration. "
-         "Under 80 words."),
+        (f"CITY: {L['city']} | Climate: {ctx['location']['climate_name']} ({ctx['location']['climate_zone']})\n"
+         f"Rainfall: {int(rain)} mm/yr ({rain_source}) | Water stress level: {stress}\n"
+         f"Humidity: {ctx['humidity_avg']}% | Temperature avg: {ctx['temperature_avg']}°C\n"
+         f"Population density: {ctx['population_density']:,}/km² ({ctx['density_class']})\n"
+         f"Full restoration plan: {'; '.join(plan)}\n"
+         f"RWH potential: {int(harvest_l):,} L/yr per 100 m² roof | "
+         f"Household coverage: {round(100*harvest_l/(5*135*365),1)}%\n"
+         f"Groundwater response: 0.3-1.0 m table rise per monsoon season at scale\n"
+         f"Irrigation savings: drip converts flood → 3-4 ML/ha/yr saved\n\n"
+         "Provide a comprehensive expert water management analysis:\n"
+         "1. HYDROLOGICAL ASSESSMENT: What does this rainfall amount and stress level "
+         "mean for this city's water security? How does the climate zone and population "
+         "density compound or mitigate the water challenge? What are the seasonal dynamics?\n"
+         "2. RESTORATION PRIORITY RATIONALE: Critically rank ALL restoration plan actions "
+         "by expected hydrological impact, implementation difficulty, and cost-effectiveness. "
+         "Explain why the top 2 actions should be done first.\n"
+         "3. RAINWATER HARVESTING ECONOMICS: At this rainfall level, what is the realistic "
+         "payback period and scaling potential for RWH? Which building types should be "
+         "prioritised for mandated RWH installation?\n"
+         "4. GROUNDWATER & LONG-TERM RESILIENCE: What are the groundwater recharge "
+         "dynamics here? What combination of interventions would build the strongest "
+         "long-term water resilience for this specific climate regime?\n"
+         "Write in expert language with practical recommendations."),
+        max_tokens=1200,
     )
     return _water_result
 
@@ -2037,16 +2080,30 @@ def run_urban_agent(ctx):
     # LLM identifies the most realistic and fastest-impact greening path for this density
     _urban_result["llm_insight"] = _agent_llm(
         "urban",
-        (f"City: {ctx['location']['city']} | Density: {d:,}/km² ({dc}) | "
-         f"WHO green deficit: {round(green_needed_ha_km2,1)} ha/km² | "
+        (f"CITY: {ctx['location']['city']} | Density: {d:,}/km² ({dc}) | "
+         f"WHO green-space deficit: {round(green_needed_ha_km2,1)} ha/km² to meet 9 m²/capita\n"
          f"Per-capita CO2: {co2_pc} t/yr | Climate: {ctx['location']['climate_name']}\n"
-         "Greening options (no-displacement): Institutional campuses, road medians, "
-         "canal banks, rooftops, parking lots\n"
-         "Dense urban toolkit top item: Miyawaki micro-forests ≥90 trees/30 m²\n\n"
-         "Task: For this specific density class and city, identify the single greening "
-         "approach from the options above that is most achievable within 12 months and "
-         "explain what makes it realistic at this population density. Flag any displacement "
-         "risk to avoid. Under 80 words."),
+         f"Trees needed for 1% CO2 offset per 1000 residents: {trees_per_1000:,}\n"
+         "No-displacement greening options: Institutional campuses (15-30% of urban land), "
+         "road medians & verges, canal/river banks, industrial buffers, rooftops, parking lots\n"
+         "Dense urban toolkit: Miyawaki micro-forests (≥90 trees/30 m²), vertical gardens "
+         "on flyover pillars, cool roofs (albedo >0.65), permeable pavement, bio-retention cells\n\n"
+         "Provide a comprehensive expert urban greening analysis:\n"
+         "1. URBAN MORPHOLOGY ANALYSIS: What does this population density and density class "
+         "mean for the realistic availability of land for greening? What proportion of the WHO "
+         "deficit can realistically be closed in 5 years without displacing residents?\n"
+         "2. GREENING STRATEGY & PRIORITISATION: Critically assess each no-displacement "
+         "greening option for this specific density class. Rank them by: (a) land availability, "
+         "(b) ecological impact, (c) implementation speed, (d) community benefit. "
+         "Which combination gives the highest green-cover gain in 3 years?\n"
+         "3. HEAT ISLAND & CO2 MITIGATION: How much ambient cooling can realistically be "
+         "achieved through the greening plan at this density? What tree cover percentage "
+         "is needed and is it achievable?\n"
+         "4. IMPLEMENTATION PATHWAY: What governance, funding, and community engagement "
+         "mechanisms are most likely to succeed for a city of this density? "
+         "What are the biggest political/practical obstacles to overcome?\n"
+         "Be specific to this density class and climate zone."),
+        max_tokens=1200,
     )
     return _urban_result
 
@@ -2220,16 +2277,36 @@ def run_energy_agent(ctx):
     _cond_e     = [i for i in items if i["feasible"].startswith("⚠️")]
     _energy_result["llm_insight"] = _agent_llm(
         "energy",
-        f"City: {ctx['location']['city']} | Solar: {round(solar,2)} kWh/m²/day | "
-        f"Wind: {round(wind,1)} m/s | Terrain: {terrain['slope_class']} | "
-        f"Grid emission factor: {grid_ef} kg CO2/kWh\n"
-        f"Feasible interventions: {[i['intervention'] for i in _feasible_e]}\n"
-        f"Conditional (site check needed): {[i['intervention'] for i in _cond_e]}\n"
-        f"Solar: {solar_plan['potential_mwp_per_km2']} MWp/km² → "
-        f"{solar_plan['co2_avoided_t_per_km2_yr']:,} t CO2/yr/km²\n\n"
-        "Task: Recommend Phase 1 → Phase 2 implementation sequence for the feasible "
-        "interventions to achieve the fastest CO2 payback. Note any site-specific "
-        "constraint that could affect Phase 1. Under 80 words.",
+        (f"CITY: {ctx['location']['city']} | Climate: {ctx['location']['climate_name']}\n"
+         f"Solar irradiance: {round(solar,2)} kWh/m²/day | Wind: {round(wind,1)} m/s\n"
+         f"Terrain: {terrain['slope_class']} | Elevation: {terrain.get('elevation_m','unknown')} m\n"
+         f"Grid emission factor: {grid_ef} kg CO2/kWh | Annual rainfall: {rain} mm\n"
+         f"Population density: {ctx['population_density']:,}/km² ({ctx['density_class']})\n"
+         "ALL interventions assessed:\n"
+         + "\n".join(f"  - {i['intervention']}: {i['feasible']} | {i['reason']} | Potential: {i['potential']}"
+                    for i in items)
+         + f"\nSolar plan: {solar_plan['usable_rooftop_m2_per_km2']:,} m²/km² → "
+         f"{solar_plan['potential_mwp_per_km2']} MWp/km² → "
+         f"{solar_plan['annual_generation_gwh_per_km2']} GWh/yr → "
+         f"{solar_plan['co2_avoided_t_per_km2_yr']:,} t CO2/yr/km² avoided\n"
+         f"Rollout phases: {' → '.join(solar_plan['phased_rollout'])}\n\n"
+         "Provide a comprehensive expert renewable energy analysis:\n"
+         "1. SITE ENERGY ASSESSMENT: How does the combination of solar irradiance, wind speed, "
+         "terrain, and density shape the renewable energy opportunity here? "
+         "What is the realistic achievable renewable energy fraction for this city in 10 years?\n"
+         "2. IMPLEMENTATION ROADMAP: Provide a detailed Phase 1 (0-12 months) and Phase 2 "
+         "(1-5 years) plan for the feasible interventions, prioritised by CO2 payback speed, "
+         "investment cost, and implementation difficulty. What barriers are most likely to "
+         "slow adoption and how should they be addressed?\n"
+         "3. GRID DECARBONISATION IMPACT: With a grid factor of "
+         f"{grid_ef} kg CO2/kWh, what is the realistic 5-year and 10-year CO2 avoidance "
+         "potential from the solar plan alone? How does this compare to carbon sequestration "
+         "from urban trees?\n"
+         "4. INNOVATION OPPORTUNITIES: Are there emerging energy technologies "
+         "(agrivoltaics, building-integrated PV, battery storage, biogas from organic waste) "
+         "particularly well-suited to this climate and density?\n"
+         "Write for energy planners and municipal decision-makers."),
+        max_tokens=1200,
     )
     return _energy_result
 
@@ -2568,7 +2645,7 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
     # leverage intervention, climate-specific edge cases.  NEVER generates numbers:
     # every figure it references comes from the deterministic agents above.
     _synthesis_ctx = _build_synthesis_context(ctx, pol, plant, water, urban, carbon, soil, energy)
-    _ai_raw = _agent_llm("synthesis", _synthesis_ctx, max_tokens=320)
+    _ai_raw = _agent_llm("synthesis", _synthesis_ctx, max_tokens=1500)
     if _ai_raw:
         # Extract per-agent insights if they exist (populated by agents in 08_agents.py)
         _agent_insights = ""
@@ -2588,6 +2665,22 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
         )
     else:
         _ai_analysis_section = ""   # No LLM available — section omitted silently
+
+    # Pre-compute per-agent AI insight callout blocks (can't use \\n inside f-string expressions)
+    def _insight_block(label, agent_dict):
+        ins = (agent_dict or {}).get("llm_insight", "").strip()
+        if not ins:
+            return ""
+        lines = "\n> ".join(ins.splitlines())
+        return f"\n> 🤖 **AI Expert Analysis — {label}:**\n> {lines}\n"
+
+    _ins_pol    = _insight_block("Pollution",       pol)
+    _ins_plant  = _insight_block("Plantation",      plant)
+    _ins_water  = _insight_block("Water",           water)
+    _ins_urban  = _insight_block("Urban Greening",  urban)
+    _ins_carbon = _insight_block("Carbon",          carbon)
+    _ins_soil   = _insight_block("Soil",            soil)
+    _ins_energy = _insight_block("Energy",          energy)
 
     all_assumptions = ctx["assumptions"] + ctx["aqi"].get("notes", [])
     assumptions = "; ".join(all_assumptions) if all_assumptions else "none"
@@ -2626,6 +2719,7 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
 - **Arrangement:** {plant['spatial_arrangement']}
 - **Priority zones:** {"; ".join(plant['priority_zones'])}
 - **Canopy layers (from selected species):** {"; ".join(f"{lyr} — {names}" for lyr, names in plant['canopy_layers'].items() if not names.startswith("—"))}
+{_ins_plant}
 
 ## Pollution Reduction Actions
 {air_status}**Short-term (24–72 h):** {"; ".join(pol['actions']['short_term_24_72h'])}
@@ -2633,15 +2727,21 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
 **Long-term (1–5 yr):** {"; ".join(pol['actions']['long_term_1_5yr'])}
 **Bio-filters:** NO2 → {", ".join(pol['biofilter_species']['NO2'])} | PM → {", ".join(pol['biofilter_species']['PM2.5/dust'])} | VOC → {", ".join(pol['biofilter_species']['VOC'])}
 **Expected gain:** {pol['expected_improvement']}
+{_ins_pol}
 
 ## Soil Improvement Actions
 {chr(10).join("- " + r for r in soil['recommendations'])}
+{_ins_soil}
 
 ## Water Conservation Recommendations
 {water_status}{chr(10).join("- " + r for r in water['restoration_plan'])}
 - **RWH:** {water['rainwater_harvesting']['per_100m2_roof_litres_yr']:,} L/yr per 100 m² roof ({water['rainwater_harvesting']['household_demand_coverage_pct']}% of a 5-person household demand); {water['rainwater_harvesting']['recharge_structures']}
 - **Groundwater:** {water['rainwater_harvesting']['groundwater_response']}
 - **Irrigation:** {"; ".join(water['irrigation'])}
+{_ins_water}
+
+## Urban Greening Strategy
+{_ins_urban}
 
 ## Biodiversity Enhancement Plan
 {chr(10).join(bio_lines)}
@@ -2653,6 +2753,7 @@ def run_synthesis(ctx, pol, plant, water, urban, carbon, soil, energy, user_type
 
 At maturity: **{carbon['annual_tonnes_at_maturity']:,} t CO2e/yr** ≈ {carbon['cars_equivalent_at_maturity']:,} cars removed ≈ {carbon['households_equivalent']:,} households' electricity. {carbon['mortality_assumption']}; {carbon['growth_curve']}. Confidence: {carbon['confidence']}.
 {urban['co2_honesty_note']} *(estimated)*
+{_ins_carbon}
 
 ## Renewable Energy & Other Improvement Scopes (feasibility-checked for this site)
 **Site:** terrain **{energy['terrain']['slope_class']}**{f" (elev {energy['terrain']['elevation_m']} m, relief {energy['terrain']['relief_m_per_km']} m/km)" if energy['terrain']['elevation_m'] is not None else ""} | **Solar:** {energy['solar_kwh_m2_day']} kWh/m²/day | **Wind:** {energy['wind_ms']} m/s | **Grid:** {energy['grid_emission_factor_kg_kwh']} kg CO2/kWh
@@ -2662,6 +2763,7 @@ At maturity: **{carbon['annual_tonnes_at_maturity']:,} t CO2e/yr** ≈ {carbon['
 {chr(10).join(f"| {i['intervention']} | {i['feasible']} | {i['reason']} | {i['potential']} |" for i in energy['interventions'])}
 
 **☀️ Solar Action Plan ({ctx['density_class']}):** usable rooftop ≈{energy['solar_plan']['usable_rooftop_m2_per_km2']:,} m²/km² → **{energy['solar_plan']['potential_mwp_per_km2']} MWp/km²** generating {energy['solar_plan']['annual_generation_gwh_per_km2']} GWh/yr/km² and avoiding **{energy['solar_plan']['co2_avoided_t_per_km2_yr']:,} t CO2/yr/km²**. Rollout: {" → ".join(energy['solar_plan']['phased_rollout'])}. Siting: {energy['solar_plan']['siting_rule']}.
+{_ins_energy}
 
 ## Predicted Environmental Impact
 With full implementation over 5 years: AQI improvement {"15–30" if ctx['aqi']['score'] > 150 else "5–15"} points locally *(estimated)*{", ambient cooling 1–3°C in greened zones" if pol['heat_island_flag'] else ""}, runoff reduction 50–80% on treated catchments, measurable pollinator and bird recovery within 3 years.
