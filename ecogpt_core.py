@@ -1423,8 +1423,12 @@ class LLMBackend:
                 ).json()
                 result = resp["choices"][0]["message"]["content"].strip()
                 usage = resp.get("usage", {})
-                _log["tokens_in"]  = usage.get("prompt_tokens",     0)
-                _log["tokens_out"] = usage.get("completion_tokens", 0)
+                # HF free-tier Inference API often omits the usage object entirely.
+                # Fall back to a character-based estimate (÷4 ≈ GPT-style token ratio).
+                _log["tokens_in"]  = (usage.get("prompt_tokens")     or
+                                      len(system + user) // 4)
+                _log["tokens_out"] = (usage.get("completion_tokens") or
+                                      len(result) // 4)
 
             _log["success"] = result is not None
 
