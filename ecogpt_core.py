@@ -1225,12 +1225,95 @@ def setup_amd_vllm(model="Qwen/Qwen3-30B-A3B", served_name="Qwen3-30B-A3B",
 LLM_LOG = []
 
 
+def fetch_vllm_metrics() -> dict:
+    """Fetch and parse Prometheus metrics from the AMD vLLM /metrics endpoint.
+
+    vLLM exposes real cumulative token counts, request latency histograms,
+    GPU KV-cache utilisation, and queue depth — more accurate than the per-
+    response usage object (which some clients omit).
+
+    Returns a dict with these keys (all floats, 0.0 on error):
+        prompt_tokens_total      – cumulative input tokens served
+        generation_tokens_total  – cumulative output tokens generated
+        requests_success_total   – successful completions
+        requests_running         – in-flight requests right now
+        requests_waiting         – queued but not yet scheduled
+        gpu_cache_usage_perc     – KV-cache fill fraction (0–1)
+        e2e_latency_mean_ms      – mean end-to-end latency derived from histogram
+        ttft_mean_ms             – mean time-to-first-token from histogram
+        raw_text                 – full Prometheus text (empty on error)
+    """
+    out = {k: 0.0 for k in (
+        "prompt_tokens_total", "generation_tokens_total",
+        "requests_success_total", "requests_running", "requests_waiting",
+        "gpu_cache_usage_perc", "e2e_latency_mean_ms", "ttft_mean_ms",
+    )}
+    out["raw_text"] = ""
+    if not AMD_VLLM_URL:
+        return out
+    try:
+        headers = {}
+        if AMD_VLLM_KEY:
+            headers["Authorization"] = f"Bearer {AMD_VLLM_KEY}"
+        resp = _rq.get(f"{AMD_VLLM_URL.rstrip('/')}/metrics",
+                       headers=headers, timeout=5)
+        if resp.status_code != 200:
+            return out
+        text = resp.text
+        out["raw_text"] = text
+
+        def _gauge(name):
+            """Extract a gauge value: first non-NaN line matching the metric name."""
+            import re as _re
+            for m in _re.finditer(rf'^{re.escape(name)}{{[^}}]*}}\s+([\d.eE+\-]+)',
+                                  text, _re.MULTILINE):
+                try:
+                    v = float(m.group(1))
+                    if v == v:   # NaN check
+                        return v
+                except ValueError:
+                    pass
+            return 0.0
+
+        def _hist_mean(name):
+            """Derive mean from Prometheus histogram _sum / _count (in seconds → ms)."""
+            import re as _re
+            s = c = 0.0
+            for m in _re.finditer(
+                    rf'^{re.escape(name)}_sum{{[^}}]*}}\s+([\d.eE+\-]+)',
+                    text, _re.MULTILINE):
+                try: s += float(m.group(1))
+                except ValueError: pass
+            for m in _re.finditer(
+                    rf'^{re.escape(name)}_count{{[^}}]*}}\s+([\d.eE+\-]+)',
+                    text, _re.MULTILINE):
+                try: c += float(m.group(1))
+                except ValueError: pass
+            return round((s / c) * 1000, 1) if c > 0 else 0.0
+
+        out["prompt_tokens_total"]     = _gauge("vllm:prompt_tokens_total")
+        out["generation_tokens_total"] = _gauge("vllm:generation_tokens_total")
+        out["requests_success_total"]  = _gauge("vllm:request_success_total")
+        out["requests_running"]        = _gauge("vllm:num_requests_running")
+        out["requests_waiting"]        = _gauge("vllm:num_requests_waiting")
+        out["gpu_cache_usage_perc"]    = _gauge("vllm:gpu_cache_usage_perc")
+        out["e2e_latency_mean_ms"]     = _hist_mean("vllm:e2e_request_latency_seconds")
+        out["ttft_mean_ms"]            = _hist_mean("vllm:time_to_first_token_seconds")
+    except Exception:
+        pass
+    return out
+
+
 def llm_usage_summary():
     """Print a human-readable summary of all LLM calls made so far.
 
     Shows: backend used, total calls, total tokens (in/out), mean latency,
     and per-call detail.  Call this at the end of a notebook session to
-    audit inference cost and performance."""
+    audit inference cost and performance.
+
+    When AMD vLLM is the active backend, also fetches the /metrics endpoint
+    for server-side cumulative token counts and GPU cache utilisation.
+    """
     if not LLM_LOG:
         print("No LLM calls logged yet.")
         return
@@ -1247,6 +1330,19 @@ def llm_usage_summary():
     print(f"  Avg latency: {mean_lat:.0f} ms   "
           f"Min: {min(e['latency_ms'] for e in LLM_LOG)} ms   "
           f"Max: {max(e['latency_ms'] for e in LLM_LOG)} ms")
+    # If AMD vLLM is active, pull server-side metrics for ground-truth counts
+    if LLM_LOG[-1]["backend"] == "amd_vllm":
+        m = fetch_vllm_metrics()
+        if m["prompt_tokens_total"] > 0:
+            print(f"{'─'*62}")
+            print(f"  AMD vLLM server metrics (cumulative since server start):")
+            print(f"    Prompt tokens served : {m['prompt_tokens_total']:,.0f}")
+            print(f"    Generated tokens     : {m['generation_tokens_total']:,.0f}")
+            print(f"    Successful requests  : {m['requests_success_total']:.0f}")
+            print(f"    GPU KV-cache usage   : {m['gpu_cache_usage_perc']*100:.1f}%")
+            print(f"    E2E latency (mean)   : {m['e2e_latency_mean_ms']} ms")
+            print(f"    Time-to-first-token  : {m['ttft_mean_ms']} ms")
+            print(f"    In-flight / queued   : {m['requests_running']:.0f} / {m['requests_waiting']:.0f}")
     print(f"{'─'*62}")
     for i, e in enumerate(LLM_LOG, 1):
         status = "✅" if e["success"] else "❌"
